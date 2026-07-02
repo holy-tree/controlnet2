@@ -1,102 +1,96 @@
-from typing import List, Tuple
+"""
+图像质量评估指标 (PSNR / SSIM)
+================================
 
-import numpy as np
-from numpy import ndarray
+使用 PyTorch 实现, 支持 batch 输入:
+    输入: tensor [B, 3, H, W] 或 [3, H, W], 范围 [0, 1]
+    输出: float (标量均值)
+"""
 
-
-def get_mAP(
-    preds: ndarray,
-    gt_file: str,
-    taglist: List[str]
-) -> Tuple[float, ndarray]:
-    assert preds.shape[1] == len(taglist)
-
-    # When mapping categories from test datasets to our system, there might be
-    # multiple vs one situation due to different semantic definitions of tags.
-    # So there can be duplicate tags in `taglist`. This special case is taken
-    # into account.
-    tag2idxs = {}
-    for idx, tag in enumerate(taglist):
-        if tag not in tag2idxs:
-            tag2idxs[tag] = []
-        tag2idxs[tag].append(idx)
-
-    # build targets
-    targets = np.zeros_like(preds)
-    with open(gt_file, "r") as f:
-        lines = [line.strip("\n").split(",") for line in f.readlines()]
-    assert len(lines) == targets.shape[0]
-    for i, line in enumerate(lines):
-        for tag in line[1:]:
-            targets[i, tag2idxs[tag]] = 1.0
-
-    # compute average precision for each class
-    APs = np.zeros(preds.shape[1])
-    for k in range(preds.shape[1]):
-        APs[k] = _average_precision(preds[:, k], targets[:, k])
-
-    return APs.mean(), APs
+import torch
+import torch.nn.functional as F
 
 
-def _average_precision(output: ndarray, target: ndarray) -> float:
-    epsilon = 1e-8
-
-    # sort examples
-    indices = output.argsort()[::-1]
-    # Computes prec@i
-    total_count_ = np.cumsum(np.ones((len(output), 1)))
-
-    target_ = target[indices]
-    ind = target_ == 1
-    pos_count_ = np.cumsum(ind)
-    total = pos_count_[-1]
-    pos_count_[np.logical_not(ind)] = 0
-    pp = pos_count_ / total_count_
-    precision_at_i_ = np.sum(pp)
-    precision_at_i = precision_at_i_ / (total + epsilon)
-
-    return precision_at_i
+def _to_4d(x: torch.Tensor) -> torch.Tensor:
+    """[3,H,W] -> [1,3,H,W]"""
+    if x.ndim == 3:
+        return x.unsqueeze(0)
+    return x
 
 
-def get_PR(
-    pred_file: str,
-    gt_file: str,
-    taglist: List[str]
-) -> Tuple[float, float, ndarray, ndarray]:
-    # When mapping categories from test datasets to our system, there might be
-    # multiple vs one situation due to different semantic definitions of tags.
-    # So there can be duplicate tags in `taglist`. This special case is taken
-    # into account.
-    tag2idxs = {}
-    for idx, tag in enumerate(taglist):
-        if tag not in tag2idxs:
-            tag2idxs[tag] = []
-        tag2idxs[tag].append(idx)
+def psnr(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0) -> float:
+    """
+    计算 PSNR (Peak Signal-to-Noise Ratio)。
+    pred / target: [B, 3, H, W] 或 [3, H, W], 范围 [0, 1]
+    返回: float (dB)
+    """
+    pred = _to_4d(pred).detach().float()
+    target = _to_4d(target).detach().float()
 
-    # build preds
-    with open(pred_file, "r", encoding="utf-8") as f:
-        lines = [line.strip().split(",") for line in f.readlines()]
-    preds = np.zeros((len(lines), len(tag2idxs)), dtype=bool)
-    for i, line in enumerate(lines):
-        for tag in line[1:]:
-            preds[i, tag2idxs[tag]] = True
+    mse = F.mse_loss(pred, target, reduction="mean").item()
+    if mse <= 1e-12:
+        return 100.0  # 完全相同
+    return 20.0 * torch.log10(torch.tensor(max_val)).item() - 10.0 * torch.log10(torch.tensor(mse)).item()
 
-    # build targets
-    with open(gt_file, "r", encoding="utf-8") as f:
-        lines = [line.strip().split(",") for line in f.readlines()]
-    targets = np.zeros((len(lines), len(tag2idxs)), dtype=bool)
-    for i, line in enumerate(lines):
-        for tag in line[1:]:
-            targets[i, tag2idxs[tag]] = True
 
-    assert preds.shape == targets.shape
+def _gaussian_window(window_size: int, sigma: float, device, dtype) -> torch.Tensor:
+    """生成 1D 高斯核"""
+    coords = torch.arange(window_size, device=device, dtype=dtype) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    return g
 
-    # calculate P and R
-    TPs = ( preds &  targets).sum(axis=0)  # noqa: E201, E222
-    FPs = ( preds & ~targets).sum(axis=0)  # noqa: E201, E222
-    FNs = (~preds &  targets).sum(axis=0)  # noqa: E201, E222
-    eps = 1.e-9
-    Ps = TPs / (TPs + FPs + eps)
-    Rs = TPs / (TPs + FNs + eps)
 
-    return Ps.mean(), Rs.mean(), Ps, Rs
+def _create_window(window_size: int, channels: int, device, dtype) -> torch.Tensor:
+    """生成 2D 高斯窗口 [channels, 1, ws, ws]"""
+    _1d = _gaussian_window(window_size, 1.5, device, dtype).unsqueeze(1)
+    _2d = _1d @ _1d.t()
+    window = _2d.unsqueeze(0).unsqueeze(0).expand(channels, 1, window_size, window_size).contiguous()
+    return window
+
+
+def ssim(pred: torch.Tensor, target: torch.Tensor, window_size: int = 11) -> float:
+    """
+    计算 SSIM (Structural Similarity Index)。
+    pred / target: [B, 3, H, W] 或 [3, H, W], 范围 [0, 1]
+    返回: float (0~1, 越大越好)
+    """
+    pred = _to_4d(pred).detach().float()
+    target = _to_4d(target).detach().float()
+
+    B, C, H, W = pred.shape
+    window = _create_window(window_size, C, pred.device, pred.dtype)
+
+    mu1 = F.conv2d(pred, window, padding=window_size // 2, groups=C)
+    mu2 = F.conv2d(target, window, padding=window_size // 2, groups=C)
+
+    mu1_sq = mu1 ** 2
+    mu2_sq = mu2 ** 2
+    mu1_mu2 = mu1 * mu2
+
+    sigma1_sq = F.conv2d(pred * pred, window, padding=window_size // 2, groups=C) - mu1_sq
+    sigma2_sq = F.conv2d(target * target, window, padding=window_size // 2, groups=C) - mu2_sq
+    sigma12 = F.conv2d(pred * target, window, padding=window_size // 2, groups=C) - mu1_mu2
+
+    C1 = 0.01 ** 2
+    C2 = 0.03 ** 2
+
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+
+    return ssim_map.mean().item()
+
+
+def evaluate_batch(pred_list, gt_list):
+    """
+    对一组 (pred, gt) 对计算平均 PSNR / SSIM。
+    pred_list, gt_list: list of tensors in [0, 1]
+    返回: (avg_psnr, avg_ssim)
+    """
+    psnrs, ssims = [], []
+    for p, g in zip(pred_list, gt_list):
+        psnrs.append(psnr(p, g))
+        ssims.append(ssim(p, g))
+    if not psnrs:
+        return 0.0, 0.0
+    return sum(psnrs) / len(psnrs), sum(ssims) / len(ssims)

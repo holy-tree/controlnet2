@@ -161,7 +161,7 @@ def get_validation_prompt(args, image, model, device='cuda'):
 
 def main(args, enable_xformers_memory_efficient_attention=True,):
     if args.config is not None:
-        with open(args.config, 'r') as f:
+        with open(args.config, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
         for key, value in config.items():
             if hasattr(args, key) and getattr(args, key) is None:

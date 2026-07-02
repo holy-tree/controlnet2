@@ -1,18 +1,50 @@
-pretrained_model_name_or_path: "/home/notebook/data/group/LowLevelLLM/models/diffusion_models/stable-diffusion-2-1-base"
+# 模型与训练输出路径
+pretrained_model_name_or_path: "sd-research/stable-diffusion-2-base"
 output_dir: "./experiment/ControlNetSR"
-root_folders: "/home/notebook/data/group/LowLevelLLM/DataSets/lsdir_ffhq10k"
 
-enable_xformers_memory_efficient_attention: true
-ram_ft_path: "preset/models/DAPE.pth"
+# 数据集根目录,结构需为:
+#   {dataset_root}/{weather}/{train,test}/{GT,LQ}/
+#   例如: datasets/rain/train/GT/img.png
+dataset_root: "D:/Projects/pycharm/WeaFU-main/dataprocess"
+
+# 参与训练的天气类型与划分
+weather_types: ["rain", "snow", "haze"]
+splits: ["train"]
+
+# 每个天气类型在训练时使用的样本数 (限制为该类型前 N 个样本)
+# 默认 3 3 3, 实际数据量大时可调大, 调试时可调小
+snow_num: 2
+rain_num: 2
+haze_num: 2
+
+# ==================== Prompt 配置 ====================
+# 是否启用文本 prompt 引导
+#   false: 训练时全部使用空 prompt (默认, 纯 ControlNet 图像条件训练)
+#   true:  按 prompt_ratio 概率使用天气相关 prompt
+use_prompt: false
+
+# 当 use_prompt=true 时, 使用天气 prompt 的比例
+# 推荐范围: 0.15 ~ 0.25
+prompt_ratio: 0.2
+
+# 各天气类型对应的 prompt 描述 (仅在 use_prompt=true 时生效)
+weather_prompts:
+  rain: "rainy scene, rain streaks on the image, wet surfaces, overcast sky"
+  snow: "snowy scene, snowflakes covering the image, cold atmosphere, white noise"
+  haze: "hazy scene, foggy atmosphere, low visibility, grayish tone"
+
+# ==================== 训练超参数 ====================
+enable_xformers_memory_efficient_attention: false
 mixed_precision: "fp16"
 resolution: 512
-learning_rate: 5e-5
+learning_rate: 5.0e-5
 train_batch_size: 4
 gradient_accumulation_steps: 1
 null_text_ratio: 0.5
 dataloader_num_workers: 0
 checkpointing_steps: 500
 
+# ==================== 其他参数 (保持不变) ====================
 seed: null
 revision: null
 variant: null
@@ -40,6 +72,11 @@ hub_model_id: null
 logging_dir: "logs"
 allow_tf32: false
 report_to: "tensorboard"
+tracker_project_name: "train_controlnet_SR"
+
+# 保留旧字段以兼容 (使用新的 dataset_root + weather_types 即可, 以下字段可忽略)
+root_folders: ""
+ram_ft_path: null
 dataset_name: null
 dataset_config_name: null
 train_data_dir: null
@@ -52,4 +89,15 @@ validation_prompt: null
 validation_image: null
 num_validation_images: 4
 validation_steps: 1
-tracker_project_name: "train_controlnet_SR"
+
+# ==================== Epoch 结束时的验证 ====================
+# 是否在每个 epoch 结束后进行验证
+run_validation: true
+# 每种天气生成的预测样本数 (同时也是 PSNR/SSIM 评估的样本数上限)
+validation_num_samples: 4
+# 验证时使用的扩散推理步数 (训练时为节省时间可用较小值,如 20)
+validation_inference_steps: 20
+# 验证时使用的 CFG guidance_scale
+validation_guidance_scale: 5.5
+# 验证 negative prompt
+validation_negative_prompt: "dotted, noise, blur, lowres, smooth"

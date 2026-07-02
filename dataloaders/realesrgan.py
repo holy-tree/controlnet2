@@ -45,7 +45,7 @@ def ordered_yaml():
     return Loader, Dumper
 
 def opt_parse(opt_path):
-    with open(opt_path, mode='r') as f:
+    with open(opt_path, mode='r', encoding='utf-8') as f:
         Loader, _ = ordered_yaml()
         opt = yaml.load(f, Loader=Loader) 
 

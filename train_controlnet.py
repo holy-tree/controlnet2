@@ -19,6 +19,7 @@ import math
 import os
 import random
 import shutil
+from datetime import datetime
 from pathlib import Path
 
 import yaml
@@ -54,6 +55,8 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
 from dataloaders.paired_dataset import PairedCaptionDataset
+
+from ramseesr.utils.metrics import psnr as calc_psnr, ssim as calc_ssim
 
 from typing import Mapping, Any
 from torchvision import transforms
@@ -443,7 +446,8 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers."
+        "--enable_xformers_memory_efficient_attention", type=lambda x: x.lower() == "true", default=None,
+        help="Whether or not to use xformers (default: auto detect)"
     )
     parser.add_argument(
         "--set_grads_to_none",
@@ -563,6 +567,41 @@ def parse_args(input_args=None):
     parser.add_argument("--null_text_ratio", type=float, default=0.5)
     parser.add_argument("--ram_ft_path", type=str, default=None)
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config file")
+
+    # 新增:三层嵌套数据集配置
+    parser.add_argument("--dataset_root", type=str, default="./datasets",
+                        help="数据集根目录, 结构: {dataset_root}/{weather}/{split}/{GT,LQ}/")
+    parser.add_argument("--weather_types", type=str, nargs="+", default=["rain", "snow", "haze"],
+                        help="参与训练的天气类型列表")
+    parser.add_argument("--splits", type=str, nargs="+", default=["train"],
+                        help="参与训练的数据划分列表")
+    parser.add_argument("--rain_num", type=int, default=3,
+                        help="rain 数据集使用的样本数 (默认 3)")
+    parser.add_argument("--snow_num", type=int, default=3,
+                        help="snow 数据集使用的样本数 (默认 3)")
+    parser.add_argument("--haze_num", type=int, default=3,
+                        help="haze 数据集使用的样本数 (默认 3)")
+
+    # 新增:Prompt 开关
+    parser.add_argument("--use_prompt", action="store_true",
+                        help="是否使用 prompt 文本引导 (默认 False, 仅图像条件训练)")
+    parser.add_argument("--prompt_ratio", type=float, default=0.2,
+                        help="use_prompt=True 时使用天气 prompt 的概率 (推荐 0.15~0.25)")
+    parser.add_argument("--weather_prompts", type=str, nargs="+", default=None,
+                        help="自定义天气 prompt 描述, 格式: rain:desc snow:desc haze:desc")
+
+    # 新增:每个 epoch 结束时的验证
+    parser.add_argument("--run_validation", type=lambda x: x.lower() == "true", default=None,
+                        help="是否在每个 epoch 结束后进行验证")
+    parser.add_argument("--validation_num_samples", type=int, default=4,
+                        help="每种天气生成的预测样本数 (验证时采样数)")
+    parser.add_argument("--validation_inference_steps", type=int, default=20,
+                        help="验证时扩散推理步数")
+    parser.add_argument("--validation_guidance_scale", type=float, default=5.5,
+                        help="验证时 CFG guidance_scale")
+    parser.add_argument("--validation_negative_prompt", type=str,
+                        default="dotted, noise, blur, lowres, smooth",
+                        help="验证时的 negative prompt")
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -735,15 +774,54 @@ def collate_fn(examples):
     }
 
 
+def _coerce_yaml_value(current, value):
+    """
+    PyYAML 在解析类似 '5e-5' 时有时会返回字符串而不是 float,
+    这里根据 argparse 端的原始类型做一次转换保护。
+    """
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(current, float) and isinstance(value, str):
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return value
+    if isinstance(current, int) and isinstance(value, str):
+        try:
+            return int(value)
+        except (ValueError, TypeError):
+            return value
+    return value
+
+
 def main(args):
     if args.config is not None:
-        with open(args.config, 'r') as f:
+        with open(args.config, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
         for key, value in config.items():
-            if hasattr(args, key) and getattr(args, key) is None:
+            if hasattr(args, key):
+                current = getattr(args, key)
+                # 只有当 YAML 中的值不为 None 时才覆盖 (None 表示"未设置")
+                if value is None:
+                    continue
+                # list 类型: 优先用 YAML 的 (YAML 一般更明确)
+                if isinstance(current, list) and current and not isinstance(value, list):
+                    # 当前是默认 list 且 YAML 不是 list (如 bool), 跳过
+                    continue
+                setattr(args, key, _coerce_yaml_value(current, value))
+            else:
                 setattr(args, key, value)
-            elif not hasattr(args, key):
-                setattr(args, key, value)
+
+    # 解析 weather_prompts (从 dict 或 CLI 的 key:value 列表)
+    weather_prompts_dict = None
+    if isinstance(args.weather_prompts, list):
+        weather_prompts_dict = {}
+        for item in args.weather_prompts:
+            if ":" in item:
+                k, v = item.split(":", 1)
+                weather_prompts_dict[k.strip()] = v.strip()
+    elif isinstance(args.weather_prompts, dict):
+        weather_prompts_dict = args.weather_prompts
 
     logging_dir = Path(args.output_dir, args.logging_dir)
 
@@ -930,16 +1008,33 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    train_dataset = PairedCaptionDataset(root_folders=args.root_folders,
-                                        tokenizer=tokenizer,
-                                        null_text_ratio=args.null_text_ratio,
+    # 按 weather 限制样本数: 优先用 args.<weather>_num, 否则不限制
+    weather_num_samples = {}
+    for w in args.weather_types:
+        attr = f"{w}_num"
+        if hasattr(args, attr):
+            v = getattr(args, attr)
+            if v is not None and v > 0:
+                weather_num_samples[w] = v
+
+    train_dataset = PairedCaptionDataset(
+        dataset_root=args.dataset_root,
+        weather_types=args.weather_types,
+        splits=args.splits,
+        tokenizer=tokenizer,
+        null_text_ratio=args.null_text_ratio,
+        use_prompt=args.use_prompt,
+        prompt_ratio=args.prompt_ratio,
+        weather_prompts=weather_prompts_dict,
+        resolution=args.resolution,
+        weather_num_samples=weather_num_samples,
     )
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         num_workers=args.dataloader_num_workers,
         batch_size=args.train_batch_size,
-        shuffle=False
+        shuffle=True
     )
 
 
@@ -993,6 +1088,17 @@ def main(args):
         # tensorboard cannot handle list types for config
         tracker_config.pop("validation_prompt")
         tracker_config.pop("validation_image")
+
+        # 过滤掉 tensorboard add_hparams 不支持的类型 (Path/None/复杂对象等)
+        def _to_tb_value(v):
+            if v is None:
+                return "None"
+            if isinstance(v, (str, bool, int, float)):
+                return v
+            if isinstance(v, list):
+                return ",".join(str(x) for x in v)
+            return str(v)
+        tracker_config = {k: _to_tb_value(v) for k, v in tracker_config.items()}
 
         accelerator.init_trackers(args.tracker_project_name, config=tracker_config)
 
@@ -1157,6 +1263,19 @@ def main(args):
             if global_step >= args.max_train_steps:
                 break
 
+        # ===== Epoch 结束: 验证 + PSNR/SSIM =====
+        if args.run_validation:
+            # 确保 controlnet / unet / vae 处于 eval 模式
+            controlnet.eval()
+            unet.eval()
+            vae.eval()
+            run_epoch_validation(
+                vae, unet, controlnet, text_encoder, tokenizer,
+                accelerator, weight_dtype, args, epoch, train_dataset
+            )
+            # 恢复 train 模式
+            controlnet.train()
+
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
@@ -1178,6 +1297,141 @@ def main(args):
             )
 
     accelerator.end_training()
+
+
+@torch.no_grad()
+def run_epoch_validation(vae, unet, controlnet, text_encoder, tokenizer, accelerator, weight_dtype, args, epoch, train_dataset):
+    """
+    每个 epoch 结束后调用:
+      1. 对 rain/snow/haze 三种天气,各生成 N 张 pred 图,保存到 validation/<timestamp>/<weather>/ 下
+      2. 计算验证集上的 PSNR / SSIM (基于生成的 pred 与 GT 比较)
+    """
+    if not accelerator.is_main_process:
+        return
+
+    logger.info(f"[Epoch {epoch}] 开始验证 ...")
+
+    # 创建本次验证的输出目录: output_dir/validation/<timestamp>_epoch<epoch>/
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    val_root = Path(args.output_dir) / "validation" / f"{timestamp}_epoch{epoch}"
+    val_root.mkdir(parents=True, exist_ok=True)
+
+    # 创建 inference pipeline (与 test.py 一致)
+    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        vae=vae,
+        text_encoder=text_encoder,
+        tokenizer=tokenizer,
+        unet=unet,
+        controlnet=accelerator.unwrap_model(controlnet),
+        safety_checker=None,
+        revision=args.revision,
+        variant=args.variant,
+        torch_dtype=weight_dtype,
+    )
+    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
+    pipeline = pipeline.to(accelerator.device)
+    pipeline.set_progress_bar_config(disable=True)
+
+    num_samples = args.validation_num_samples
+    weather_metrics = {}  # weather -> {"psnr": [...], "ssim": [...]}
+
+    for weather in args.weather_types:
+        # 从 train_dataset.samples 中按 weather 抽取 num_samples 个样本
+        candidates = [s for s in train_dataset.samples if s[2] == weather]
+        if not candidates:
+            logger.warn(f"[Epoch {epoch}] 没有 {weather} 类别的样本, 跳过")
+            continue
+
+        # 固定种子以便复现
+        random.seed(epoch * 1000 + hash(weather) % 1000)
+        selected = random.sample(candidates, min(num_samples, len(candidates)))
+
+        weather_dir = val_root / weather
+        weather_dir.mkdir(parents=True, exist_ok=True)
+
+        psnr_list, ssim_list = [], []
+
+        for sample_idx, (gt_path, lq_path, _) in enumerate(selected):
+            # 读取 LQ 和 GT
+            from torchvision import transforms as tvt
+            preprocess = tvt.Compose([
+                tvt.Resize(args.resolution, interpolation=tvt.InterpolationMode.BILINEAR),
+                tvt.CenterCrop(args.resolution),
+                tvt.ToTensor(),
+            ])
+            lq_img = preprocess(Image.open(lq_path).convert("RGB"))
+            gt_img = preprocess(Image.open(gt_path).convert("RGB"))
+
+            # GT 归一化到 [-1, 1] 后通过 VAE 重建 -> 比较"重建的 GT"与"模型生成的 pred"
+            # 实际上: pred 是从 LQ 生成的恢复图, 我们将其与 GT 在像素空间比较
+            prompt = ""
+            if args.use_prompt and random.random() < args.prompt_ratio:
+                prompt = train_dataset.weather_prompts.get(weather, "")
+
+            # 把 LQ 喂给 pipeline, 生成 pred
+            lq_pil = tvt.ToPILImage()(lq_img)
+            with torch.autocast("cuda"):
+                pred_pil = pipeline(
+                    prompt,
+                    lq_pil,
+                    num_inference_steps=args.validation_inference_steps,
+                    guidance_scale=args.validation_guidance_scale,
+                    negative_prompt=args.validation_negative_prompt,
+                    height=args.resolution,
+                    width=args.resolution,
+                ).images[0]
+
+            # pred -> tensor [3,H,W] in [0,1]
+            pred_tensor = tvt.ToTensor()(pred_pil).to(accelerator.device).clamp(0, 1)
+
+            # 计算 PSNR / SSIM (pred vs gt, 都在 [0,1])
+            p = calc_psnr(pred_tensor, gt_img.to(accelerator.device))
+            s = calc_ssim(pred_tensor, gt_img.to(accelerator.device))
+            psnr_list.append(p)
+            ssim_list.append(s)
+
+            # 保存 pred 和 GT LQ 图像
+            stem = Path(gt_path).stem
+            pred_pil.save(weather_dir / f"{sample_idx:03d}_{stem}_pred.png")
+            lq_pil.save(weather_dir / f"{sample_idx:03d}_{stem}_lq.png")
+            # 也保存 GT 作为参考 (便于人工查看)
+            gt_pil = tvt.ToPILImage()(gt_img)
+            gt_pil.save(weather_dir / f"{sample_idx:03d}_{stem}_gt.png")
+
+        if psnr_list:
+            avg_p = sum(psnr_list) / len(psnr_list)
+            avg_s = sum(ssim_list) / len(ssim_list)
+            weather_metrics[weather] = {"psnr": avg_p, "ssim": avg_s}
+            logger.info(f"[Epoch {epoch}] [{weather}] PSNR={avg_p:.3f} dB, SSIM={avg_s:.4f} (n={len(psnr_list)})")
+
+    # 写一个汇总 JSON / txt
+    summary_path = val_root / "metrics.txt"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        f.write(f"Epoch: {epoch}\n")
+        f.write(f"Timestamp: {timestamp}\n")
+        f.write(f"Num samples per weather: {num_samples}\n")
+        f.write(f"Inference steps: {args.validation_inference_steps}\n")
+        f.write(f"Guidance scale: {args.validation_guidance_scale}\n\n")
+        f.write("Per-weather metrics:\n")
+        for weather, m in weather_metrics.items():
+            f.write(f"  {weather:8s}  PSNR={m['psnr']:.3f} dB  SSIM={m['ssim']:.4f}\n")
+        if weather_metrics:
+            avg_psnr = sum(m["psnr"] for m in weather_metrics.values()) / len(weather_metrics)
+            avg_ssim = sum(m["ssim"] for m in weather_metrics.values()) / len(weather_metrics)
+            f.write(f"\nAverage:        PSNR={avg_psnr:.3f} dB  SSIM={avg_ssim:.4f}\n")
+
+    # 也通过 accelerator.log 记录到 tensorboard / wandb
+    log_dict = {f"val/{w}/psnr": m["psnr"] for w, m in weather_metrics.items()}
+    log_dict.update({f"val/{w}/ssim": m["ssim"] for w, m in weather_metrics.items()})
+    if weather_metrics:
+        log_dict["val/avg_psnr"] = sum(m["psnr"] for m in weather_metrics.values()) / len(weather_metrics)
+        log_dict["val/avg_ssim"] = sum(m["ssim"] for m in weather_metrics.values()) / len(weather_metrics)
+    accelerator.log(log_dict, step=epoch)
+
+    logger.info(f"[Epoch {epoch}] 验证完成, 结果保存到: {val_root}")
+    del pipeline
+    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":

@@ -15,7 +15,8 @@ dependencies = [
     "pyyaml>=6.0",
     "tensorboard>=2.14.0",
     "wandb>=0.15.0",
-    "basicsr>=1.4.0"
+    "basicsr>=1.4.0",
+    "datasets>=3.1.0",
 ]
 
 [project.optional-dependencies]
