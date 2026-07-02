@@ -1,0 +1,23 @@
+controlnet_model_path: "/home/notebook/code/personal/S9048624/sr/SeeSR/preset/ckp"
+ram_ft_path: "/home/notebook/code/personal/S9048624/sr/SeeSR/preset/DAPE.pth"
+pretrained_model_path: "/home/notebook/code/personal/S9048624/sr/stable-diffusion-2-base"
+prompt: ""
+added_prompt: "clean, high-resolution, 8k"
+negative_prompt: "dotted, noise, blur, lowres, smooth"
+image_path: "/home/notebook/code/personal/S9048624/sr/ossr_version_0425/benchmark/RealLR200/LR"
+output_dir: "/home/notebook/code/personal/S9048624/sr/ossr_version_0425/benchmark/RealLR200/SeeSR5.5cfg2"
+mixed_precision: "fp16"
+guidance_scale: 5.5
+conditioning_scale: 1.0
+blending_alpha: 1.0
+num_inference_steps: 20
+process_size: 512
+vae_decoder_tiled_size: 2048
+vae_encoder_tiled_size: 2048
+latent_tiled_size: 96
+latent_tiled_overlap: 32
+upscale: 4
+seed: null
+sample_times: 1
+align_method: "adain"
+save_prompts: false

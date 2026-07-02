@@ -1,0 +1,42 @@
+[project]
+name = "controlnet-sr"
+version = "0.1.0"
+description = "ControlNet-based Image Super-Resolution with RAM integration"
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "torch>=2.0.0",
+    "diffusers>=0.25.0",
+    "transformers>=4.30.0",
+    "accelerate>=0.20.0",
+    "Pillow>=9.0.0",
+    "opencv-python>=4.8.0",
+    "numpy>=1.24.0",
+    "pyyaml>=6.0",
+    "tensorboard>=2.14.0",
+    "wandb>=0.15.0",
+    "basicsr>=1.4.0"
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+train_controlnet = "train_controlnet:main"
+test_controlnet = "test:main"
+
+
+[tool.uv]
+index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+extra-index-url = ["https://download.pytorch.org/whl/cu126",
+"https://pypi.org/simple"  # 新增官方源，补tb-nightly
+]
+# 新增这一行，强制优先匹配带+cu126的gpu包
+index-strategy = "unsafe-best-match"
+
+[tool.uv.extra-build-dependencies]
+basicsr = ["torch>=2.0.0"]
