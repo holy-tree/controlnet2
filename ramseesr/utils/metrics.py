@@ -94,3 +94,58 @@ def evaluate_batch(pred_list, gt_list):
     if not psnrs:
         return 0.0, 0.0
     return sum(psnrs) / len(psnrs), sum(ssims) / len(ssims)
+
+
+# ============================================================
+# LPIPS (Learned Perceptual Image Patch Similarity)
+# ============================================================
+# LPIPS 需要预训练 backbone, 第一次调用时会自动下载权重 (~50MB)
+#   - 'alex': 基于 AlexNet, 更快
+#   - 'vgg':  基于 VGG, 更准但更慢
+_LPIPS_MODEL = None
+_LPIPS_NET = None
+_LPIPS_DEVICE = None
+
+
+def _get_lpips_model(net: str = "alex", device=None):
+    """
+    懒加载 LPIPS 模型 (避免每次调用都重新加载权重)。
+    device: 目标设备 (None 则保持 CPU, 等首次调用时再迁移)
+    """
+    global _LPIPS_MODEL, _LPIPS_NET, _LPIPS_DEVICE
+    if _LPIPS_MODEL is None or _LPIPS_NET != net:
+        import lpips as lpips_pkg
+        _LPIPS_MODEL = lpips_pkg.LPIPS(net=net, verbose=False)
+        _LPIPS_MODEL.eval()
+        _LPIPS_NET = net
+        _LPIPS_DEVICE = None  # 强制首次迁移
+    # 必要时把模型迁移到目标 device
+    if device is not None and _LPIPS_DEVICE != device:
+        _LPIPS_MODEL = _LPIPS_MODEL.to(device)
+        _LPIPS_DEVICE = device
+    return _LPIPS_MODEL
+
+
+def lpips(pred: torch.Tensor, target: torch.Tensor, net: str = "alex") -> float:
+    """
+    计算 LPIPS (Learned Perceptual Image Patch Similarity)。
+    pred / target: [B, 3, H, W] 或 [3, H, W], 范围 [0, 1]
+    返回: float (越小越好, 0 表示完全相同)
+
+    依赖: pip install lpips
+    注意: 第一次调用时会下载预训练权重到 ~/.cache/torch/hub/checkpoints/
+          模型会自动迁移到与输入 tensor 相同的 device
+    """
+    pred = _to_4d(pred).detach().float()
+    target = _to_4d(target).detach().float()
+
+    # 让模型跟随输入 tensor 的 device (避免 cuda/cpu 不一致)
+    model = _get_lpips_model(net, device=pred.device)
+
+    # LPIPS 内部将 [0,1] 映射到 [-1,1]
+    pred = pred * 2.0 - 1.0
+    target = target * 2.0 - 1.0
+
+    with torch.no_grad():
+        d = model(pred, target)
+    return d.mean().item()

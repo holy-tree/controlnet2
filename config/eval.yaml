@@ -1,0 +1,58 @@
+# ==================== 模型与输出 ====================
+# 预训练 SD 模型路径 (与 train.yaml 一致)
+pretrained_model_name_or_path: "sd-research/stable-diffusion-2-base"
+# 训练好的 ControlNet 权重路径
+controlnet_model_path: "./experiment/ControlNetSR/checkpoint-50000"
+# 评估结果输出目录
+output_dir: "./experiment/eval"
+
+# ==================== 数据集配置 ====================
+# 与 train.yaml 相同的 dataset_root, 复用其目录结构
+dataset_root: "D:/Projects/pycharm/WeaFU-main/dataprocess"
+# 待评估的天气类型
+weather_types: ["rain", "snow", "haze"]
+# 评估时使用 test 划分
+splits: ["test"]
+
+# ==================== 推理参数 ====================
+resolution: 512
+num_inference_steps: 20
+guidance_scale: 5.5
+negative_prompt: "dotted, noise, blur, lowres, smooth"
+enable_xformers_memory_efficient_attention: false
+mixed_precision: "fp16"
+seed: 42
+
+# 推理时使用的 prompt (留空则全部使用空 prompt)
+use_prompt: false
+prompt_ratio: 0.2
+
+# ==================== 评估参数 ====================
+# === 评估采样数 (用于计算指标, 默认 0 = 使用全部 test 集) ===
+# 控制每个天气类别下用于计算 PSNR/SSIM/LPIPS 的样本数
+#   0  或负数: 不限制, 跑完整 test 集 (默认, 指标统计更准确)
+#   正数:      仅跑前 N 张 (用于快速调试)
+max_samples_per_weather: 0
+
+# === 可视化保存数 (与评估解耦) ===
+# 控制每个天气类别下保存多少组预测图像 (pred.png / lq.png / gt.png)
+# 评估始终跑完整 test 集 (受 max_samples_per_weather 控制),
+# 但只保存其中一部分用于人工查看
+#
+#   0  : 不保存任何预测图 (只算指标)
+#   -1 : 保存全部评估样本的图 (默认)
+#   正数: 仅保存前 N 张的图
+# 例如:
+#   rain_num: 10  -> rain 保存前 10 张
+#   snow_num: -1  -> snow 全部保存
+#   haze_num: 0   -> haze 不保存
+rain_num: 3
+snow_num: 3
+haze_num: 3
+
+# 是否启用预测图保存 (全局开关, false 则全部不保存, 覆盖每天气设置)
+save_predictions: true
+
+# ==================== LPIPS 配置 ====================
+# LPIPS 使用的 backbone: 'alex' | 'vgg' (默认 alex, 更快)
+lpips_net: "alex"
