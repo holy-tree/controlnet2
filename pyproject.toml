@@ -15,8 +15,8 @@ dependencies = [
     "pyyaml>=6.0",
     "tensorboard>=2.14.0",
     "wandb>=0.15.0",
-    "basicsr>=1.4.0",
     "datasets>=3.1.0",
+    "torchvision>=0.20.1",
 ]
 
 [project.optional-dependencies]
@@ -26,6 +26,10 @@ dev = [
     "ruff>=0.1.0",
 ]
 
+[[tool.uv.index]]
+url = "https://pypi.tuna.tsinghua.edu.cn/simple"
+default = true
+
 [project.scripts]
 train_controlnet = "train_controlnet:main"
 test_controlnet = "test:main"
@@ -33,11 +37,10 @@ test_controlnet = "test:main"
 
 [tool.uv]
 index-url = "https://pypi.tuna.tsinghua.edu.cn/simple"
-extra-index-url = ["https://download.pytorch.org/whl/cu126",
-"https://pypi.org/simple"  # 新增官方源，补tb-nightly
+extra-index-url = ["https://download.pytorch.org/whl/cu126"
 ]
 # 新增这一行，强制优先匹配带+cu126的gpu包
 index-strategy = "unsafe-best-match"
 
-[tool.uv.extra-build-dependencies]
-basicsr = ["torch>=2.0.0"]
+# [tool.uv.extra-build-dependencies]
+# basicsr = ["torch>=2.0.0", "tensorboard>=2.14.0", "setuptools"]
