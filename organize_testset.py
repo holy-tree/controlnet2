@@ -100,27 +100,49 @@ def safe_move(src: Path, dst: Path, dry_run: bool = False) -> Path:
 # ============================================================
 
 def organize_haze(root: Path, out_root: Path, dry_run: bool) -> int:
-    """haze: nyuhaze500 + outdoor. hazy 复制为 lq, GT 直接复制."""
+    """haze: nyuhaze500 + outdoor. hazy 复制为 lq."""
     print("\n[HAZE] 处理 haze 数据集...")
     haze_root = root / "haze"
     count = 0
 
     # nyuhaze500
+    # GT:LQ = 1:10, hazy 命名为 xxxx_y.png (y=1..10)
+    # 每张 GT 复制 10 份, 分别与 10 张 LQ 同名匹配
     src = haze_root / "SOTS" / "nyuhaze500"
     if src.is_dir():
         gt_dir = src / "gt"
         hazy_dir = src / "hazy"
         dst = out_root / "haze" / "SOTS_nyuhaze500"
         if gt_dir.is_dir() and hazy_dir.is_dir():
-            print(f"  [nyuhaze500] GT={len(list(gt_dir.iterdir()))} files, Hazy={len(list(hazy_dir.iterdir()))} files")
-            for f in gt_dir.iterdir():
-                if f.is_file() and is_image(f):
-                    safe_copy(f, dst / "gt" / f.name, dry_run)
-                    count += 1
-            for f in hazy_dir.iterdir():
-                if f.is_file() and is_image(f):
-                    safe_copy(f, dst / "lq" / f.name, dry_run)
-                    count += 1
+            gt_map = {p.stem: p for p in gt_dir.iterdir() if p.is_file() and is_image(p)}
+            hazy_map = {p.stem: p for p in hazy_dir.iterdir() if p.is_file() and is_image(p)}
+            print(f"  [nyuhaze500] GT={len(gt_map)} files, Hazy={len(hazy_map)} files")
+
+            # 按 GT 名分组 LQ: 例如 GT 1400 对应 hazy 1400_1 ~ 1400_10
+            # hazy 命名: xxxx_y.png  -> stem 是 "xxxx_y", 去掉 _y 找到对应 GT stem "xxxx"
+            hazy_grouped: Dict[str, List[Path]] = {}
+            for hazy_stem, hazy_path in hazy_map.items():
+                # 提取 stem 前缀 (去掉 _数字 后缀)
+                if "_" in hazy_stem:
+                    gt_stem = hazy_stem.rsplit("_", 1)[0]
+                else:
+                    gt_stem = hazy_stem
+                hazy_grouped.setdefault(gt_stem, []).append(hazy_path)
+
+            # 遍历 GT, 每张复制 N 份 (N = 该 GT 对应的 LQ 数量)
+            for gt_stem, gt_path in gt_map.items():
+                lqs = hazy_grouped.get(gt_stem, [])
+                if not lqs:
+                    print(f"    [警告] GT {gt_stem} 没有对应的 LQ, 跳过")
+                    continue
+                # 每张 GT 复制 len(lqs) 次, 文件名与对应 LQ 一致
+                for lq_path in lqs:
+                    # LQ 的最终文件名 (用 LQ 自身的 stem + suffix)
+                    lq_final_name = lq_path.name
+                    safe_copy(lq_path, dst / "lq" / lq_final_name, dry_run)
+                    safe_copy(gt_path, dst / "gt" / lq_final_name, dry_run)
+                    count += 2  # 算一对
+            print(f"  [nyuhaze500] 处理完成, 共生成 {count} 文件 (含 GT 复制)")
         else:
             print(f"  [跳过 nyuhaze500] GT/hazy 目录不全")
     else:
@@ -158,9 +180,11 @@ def organize_haze(root: Path, out_root: Path, dry_run: bool) -> int:
 def _process_rain_flat(src_dir: Path, dst: Path, dry_run: bool) -> int:
     """
     Rain100H / Rain100L 处理:
-        同级目录下: rain-xxx.png + norain-xxx.png
-        -> 将 norain-xxx.png 移入 gt/rain-xxx.png (重命名)
-        -> 将 rain-xxx.png 移入 lq/rain-xxx.png
+        服务器结构: Rain100H/rainy/rain-xxx.png, Rain100H/norain-xxx.png (norain 在 rainy 同级)
+        也兼容:    全部文件混在同一目录
+
+        -> 将 norain-xxx.png 复制为 gt/rain-xxx.png (重命名, 复制而非移动以保护原始数据)
+        -> 将 rain-xxx.png 复制为 lq/rain-xxx.png (复制保护)
     """
     if not src_dir.is_dir():
         print(f"  [跳过] {src_dir} 不存在")
@@ -168,23 +192,46 @@ def _process_rain_flat(src_dir: Path, dst: Path, dry_run: bool) -> int:
 
     rain_map: Dict[str, Path] = {}
     norain_map: Dict[str, Path] = {}
+
+    # 1. 扫描 src_dir (通常是 rainy/ 目录) 里的 rain-xxx.png
     for p in src_dir.iterdir():
         if not p.is_file() or not is_image(p):
             continue
-        s = p.stem
-        sl = s.lower()
+        sl = p.stem.lower()
         if sl.startswith("rain-"):
-            rain_map[s[5:]] = p
-        elif sl.startswith("norain-"):
-            norain_map[s[7:]] = p
+            rain_map[p.stem[5:]] = p
+
+    # 2. 扫描 src_dir.parent (例如 Rain100H/) 里的 norain-xxx.png
+    #    服务器上 norain 与 rainy 是同级目录
+    parent_dir = src_dir.parent
+    if parent_dir.is_dir():
+        for p in parent_dir.iterdir():
+            if not p.is_file() or not is_image(p):
+                continue
+            sl = p.stem.lower()
+            if sl.startswith("norain-"):
+                norain_map[p.stem[7:]] = p
+
+    # 3. 兜底: 若 src_dir 里也有 norain (兼容旧结构), 也接受
+    for p in src_dir.iterdir():
+        if not p.is_file() or not is_image(p):
+            continue
+        sl = p.stem.lower()
+        if sl.startswith("norain-"):
+            norain_map.setdefault(p.stem[7:], p)
 
     print(f"  [{src_dir.name}] rain={len(rain_map)} norain={len(norain_map)}")
+
+    if not norain_map:
+        print(f"  [跳过 {src_dir.name}] 未找到 norain-xxx.png (GT)")
+        return 0
+
     count = 0
     for key in sorted(rain_map.keys() & norain_map.keys()):
-        # norain -> gt/rain-xxx.png (移动 + 重命名)
-        safe_move(norain_map[key], dst / "gt" / f"rain-{key}{norain_map[key].suffix}", dry_run)
-        # rain -> lq/rain-xxx.png (移动 + 重命名, 实际文件名已一致)
-        safe_move(rain_map[key], dst / "lq" / f"rain-{key}{rain_map[key].suffix}", dry_run)
+        # norain -> gt/rain-xxx.png (复制 + 重命名)
+        safe_copy(norain_map[key], dst / "gt" / f"rain-{key}{norain_map[key].suffix}", dry_run)
+        # rain -> lq/rain-xxx.png (复制 + 重命名, 文件名已一致)
+        safe_copy(rain_map[key], dst / "lq" / f"rain-{key}{rain_map[key].suffix}", dry_run)
         count += 1
     return count
 
