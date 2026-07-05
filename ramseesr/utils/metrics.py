@@ -149,3 +149,94 @@ def lpips(pred: torch.Tensor, target: torch.Tensor, net: str = "alex") -> float:
     with torch.no_grad():
         d = model(pred, target)
     return d.mean().item()
+
+
+# ============================================================
+# FID (Frechet Inception Distance)
+# ============================================================
+# FID 通过预训练 InceptionV3 提取 2048 维特征, 计算两组图像的 Fréchet 距离.
+# 越低越好, 表示生成/恢复图像分布越接近真实图像分布.
+# 依赖: torchvision (提供 Inception V3 weights)
+#       第一次运行会下载 InceptionV3 权重 (~100MB) 到 ~/.cache/torch/hub/checkpoints/
+_INCEPTION_MODEL = None
+_INCEPTION_DEVICE = None
+
+
+def _get_inception_model(device=None):
+    """懒加载 InceptionV3 (aux_logits=True), 输出 2048 维特征."""
+    global _INCEPTION_MODEL, _INCEPTION_DEVICE
+    if _INCEPTION_MODEL is None:
+        from torchvision.models import inception_v3, Inception_V3_Weights
+        _INCEPTION_MODEL = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1, aux_logits=True)
+        _INCEPTION_MODEL.fc = torch.nn.Identity()  # 移除分类头, 输出 2048 维特征
+        _INCEPTION_MODEL.eval()
+        _INCEPTION_DEVICE = None
+    if device is not None and _INCEPTION_DEVICE != device:
+        _INCEPTION_MODEL = _INCEPTION_MODEL.to(device)
+        _INCEPTION_DEVICE = device
+    return _INCEPTION_MODEL
+
+
+def _inception_features(images: torch.Tensor) -> torch.Tensor:
+    """
+    提取 InceptionV3 特征.
+    images: [N, 3, H, W], 范围 [0, 1]
+    返回: [N, 2048] 特征向量
+    """
+    model = _get_inception_model(device=images.device)
+    # InceptionV3 要求 299x299 输入
+    x = torch.nn.functional.interpolate(images, size=(299, 299), mode="bilinear", align_corners=False)
+    # InceptionV3 预训练权重使用 ImageNet 标准化
+    mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
+    std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
+    x = (x - mean) / std
+
+    feats = []
+    with torch.no_grad():
+        for i in range(0, x.size(0), 32):
+            batch = x[i:i + 32]
+            f = model(batch)
+            # aux_logits=True 训练时返回 tuple, eval 时返回 tensor, 但 fc 已替换为 Identity
+            if isinstance(f, tuple):
+                f = f[0]
+            feats.append(f)
+    return torch.cat(feats, dim=0)
+
+
+def fid(pred_list, gt_list) -> float:
+    """
+    计算 FID (Frechet Inception Distance).
+    pred_list, gt_list: list of tensors in [0, 1] (任意尺寸均可, 内部 resize 到 299x299)
+    返回: float (越小越好, 表示两组图像分布越接近)
+
+    算法:
+        1. 用 InceptionV3 提取两组图像的 2048 维特征
+        2. 分别计算均值 mu 与协方差 sigma
+        3. FID = ||mu1 - mu2||^2 + Tr(sigma1 + sigma2 - 2*sqrt(sigma1 @ sigma2))
+    """
+    if not pred_list or not gt_list:
+        return float("nan")
+
+    pred_t = torch.stack([(_to_4d(p) if isinstance(p, torch.Tensor) else _to_4d(torch.as_tensor(p))).squeeze(0) for p in pred_list]).float()
+    gt_t = torch.stack([(_to_4d(g) if isinstance(g, torch.Tensor) else _to_4d(torch.as_tensor(g))).squeeze(0) for g in gt_list]).float()
+
+    pred_feats = _inception_features(pred_t).cpu().double().numpy()
+    gt_feats = _inception_features(gt_t).cpu().double().numpy()
+
+    # 计算 FID
+    import numpy as np
+    from scipy import linalg
+
+    mu1, sigma1 = pred_feats.mean(axis=0), np.cov(pred_feats, rowvar=False)
+    mu2, sigma2 = gt_feats.mean(axis=0), np.cov(gt_feats, rowvar=False)
+
+    diff = mu1 - mu2
+    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    if not np.isfinite(covmean).all():
+        offset = np.eye(sigma1.shape[0]) * 1e-6
+        covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+    if np.iscomplexobj(covmean):
+        covmean = covmean.real
+
+    fid_val = diff.dot(diff) + np.trace(sigma1) + np.trace(sigma2) - 2 * np.trace(covmean)
+    return float(fid_val)

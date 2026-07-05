@@ -9,6 +9,7 @@ ControlNet 多天气图像恢复 - 独立评估脚本
     PSNR  -- 越高越好
     SSIM  -- 越高越好 (0~1)
     LPIPS -- 越低越好 (感知距离)
+    FID   -- 越低越好 (InceptionV3 特征分布距离)
 
 输出:
     <output_dir>/<timestamp>_eval/
@@ -48,7 +49,7 @@ from diffusers import (
 from diffusers.utils.import_utils import is_xformers_available
 
 from dataloaders.paired_dataset import DEFAULT_WEATHER_PROMPTS, PairedCaptionDataset
-from ramseesr.utils.metrics import lpips, psnr as calc_psnr, ssim as calc_ssim
+from ramseesr.utils.metrics import fid as calc_fid, lpips, psnr as calc_psnr, ssim as calc_ssim
 
 
 def parse_args():
@@ -66,7 +67,8 @@ def load_config(path: str) -> dict:
 def build_dataset_for_eval(args_config: dict):
     """
     复用 PairedCaptionDataset 加载 test 集, 但不实际使用 __getitem__.
-    我们只需要它扫到的样本路径列表 (samples)。
+    我们只需要它扫到的样本路径列表 (samples).
+    支持三种独立数据集路径: dataset_rain, dataset_snow, dataset_haze.
     """
     class _EmptyTokenizer:
         model_max_length = 77
@@ -75,16 +77,26 @@ def build_dataset_for_eval(args_config: dict):
                 input_ids = [[0] * 77]
             return R()
 
-    ds = PairedCaptionDataset(
-        dataset_root=args_config["dataset_root"],
-        weather_types=args_config["weather_types"],
-        splits=args_config["splits"],
-        tokenizer=_EmptyTokenizer(),
-        null_text_ratio=0.0,
-        use_prompt=False,
-        resolution=args_config["resolution"],
-    )
-    return ds.samples
+    all_samples = []
+    for weather in args_config["weather_types"]:
+        root_key = f"dataset_{weather}"
+        dataset_root = args_config.get(root_key)
+        if not dataset_root:
+            print(f"[warn] {root_key} 未设置, 跳过 {weather}")
+            continue
+
+        ds = PairedCaptionDataset(
+            dataset_root=dataset_root,
+            weather_types=[weather],
+            splits=args_config["splits"],
+            tokenizer=_EmptyTokenizer(),
+            null_text_ratio=0.0,
+            use_prompt=False,
+            resolution=args_config["resolution"],
+        )
+        all_samples.extend(ds.samples)
+
+    return all_samples
 
 
 def resolve_controlnet_path(raw_path: str) -> str:
@@ -224,6 +236,11 @@ def evaluate(args_config: dict):
     # ===== 评估循环 =====
     # 存储每张图的指标: per_image_results[weather] = [(name, psnr, ssim, lpips), ...]
     per_image_results: Dict[str, List] = defaultdict(list)
+    # 收集预测与 GT 张量, 用于计算 FID (每个 weather 一组)
+    fid_preds: Dict[str, List[torch.Tensor]] = defaultdict(list)
+    fid_gts: Dict[str, List[torch.Tensor]] = defaultdict(list)
+    # 是否启用 FID
+    enable_fid = args_config.get("enable_fid", True)
 
     # 固定种子以便复现
     if args_config.get("seed") is not None:
@@ -283,6 +300,11 @@ def evaluate(args_config: dict):
             stem = Path(gt_path).stem
             per_image_results[weather].append((stem, p, s, l, infer_time))
 
+            # 收集用于 FID 计算的张量 (CPU 张量, 避免长时间占 GPU 显存)
+            if enable_fid:
+                fid_preds[weather].append(pred_tensor.detach().cpu())
+                fid_gts[weather].append(gt_tensor.detach().cpu())
+
             # 保存图片 (受 save_counts 控制, 与评估数解耦)
             if sample_idx < n_to_save:
                 pred_pil.save(weather_dir / f"{sample_idx:03d}_{stem}_pred.png")
@@ -308,6 +330,39 @@ def evaluate(args_config: dict):
             "lpips": sum(lpipss) / len(lpipss) if lpipss else float("nan"),
             "avg_time": sum(times) / len(times) if times else 0.0,
         }
+
+    # ===== 计算 FID (按 weather 汇总) =====
+    if enable_fid:
+        print("\n[FID] 开始计算 FID...")
+        for weather in args_config["weather_types"]:
+            if weather not in fid_preds or len(fid_preds[weather]) == 0:
+                continue
+            try:
+                fid_val = calc_fid(fid_preds[weather], fid_gts[weather])
+                weather_metrics[weather]["fid"] = fid_val
+                print(f"  [FID] {weather}: {fid_val:.4f} (N={len(fid_preds[weather])})")
+            except Exception as e:
+                print(f"  [FID] {weather} 计算失败: {e}")
+                weather_metrics[weather]["fid"] = float("nan")
+        # 总体 FID (所有 weather 合并)
+        all_preds = []
+        all_gts = []
+        for w in fid_preds:
+            all_preds.extend(fid_preds[w])
+            all_gts.extend(fid_gts[w])
+        if all_preds:
+            try:
+                overall_fid = calc_fid(all_preds, all_gts)
+                print(f"  [FID] Overall: {overall_fid:.4f} (N={len(all_preds)})")
+            except Exception as e:
+                print(f"  [FID] Overall 计算失败: {e}")
+                overall_fid = float("nan")
+        else:
+            overall_fid = float("nan")
+    else:
+        overall_fid = float("nan")
+        for w in weather_metrics:
+            weather_metrics[w]["fid"] = float("nan")
 
     # 写每个 weather 的 per_image 指标文件
     for weather, items in per_image_results.items():
@@ -338,7 +393,8 @@ def evaluate(args_config: dict):
         f.write(f"Timestamp:        {timestamp}\n")
         f.write(f"Model:           {args_config['controlnet_model_path']}\n")
         f.write(f"SD base:         {args_config['pretrained_model_name_or_path']}\n")
-        f.write(f"Dataset root:    {args_config['dataset_root']}\n")
+        ds_roots = {w: args_config.get(f"dataset_{w}", "N/A") for w in args_config["weather_types"]}
+        f.write(f"Dataset roots:   rain={ds_roots.get('rain', 'N/A')}, snow={ds_roots.get('snow', 'N/A')}, haze={ds_roots.get('haze', 'N/A')}\n")
         f.write(f"Splits:          {args_config['splits']}\n")
         f.write(f"Weather types:   {args_config['weather_types']}\n")
         f.write(f"Resolution:      {args_config['resolution']}\n")
@@ -346,8 +402,9 @@ def evaluate(args_config: dict):
         f.write(f"Guidance scale:  {args_config['guidance_scale']}\n")
         f.write(f"Use prompt:      {args_config.get('use_prompt', False)}\n")
         f.write(f"LPIPS backbone:  {lpips_net}\n")
+        f.write(f"FID enabled:     {enable_fid}\n")
         f.write("-" * 70 + "\n")
-        f.write(f"{'Weather':<12} {'N':>5} {'PSNR (dB)':>10} {'SSIM':>10} {'LPIPS':>10} {'AvgTime(s)':>12}\n")
+        f.write(f"{'Weather':<12} {'N':>5} {'PSNR (dB)':>10} {'SSIM':>10} {'LPIPS':>10} {'FID':>10} {'AvgTime(s)':>12}\n")
         f.write("-" * 70 + "\n")
 
         for weather in args_config["weather_types"]:
@@ -355,32 +412,36 @@ def evaluate(args_config: dict):
                 continue
             m = weather_metrics[weather]
             lpips_str = f"{m['lpips']:.4f}" if m['lpips'] == m['lpips'] else "  N/A  "
+            fid_str = f"{m.get('fid', float('nan')):.4f}" if m.get('fid', float('nan')) == m.get('fid', float('nan')) else "  N/A  "
             f.write(f"{weather:<12} {m['n']:>5} {m['psnr']:>10.4f} {m['ssim']:>10.4f} "
-                    f"{lpips_str:>10} {m['avg_time']:>12.2f}\n")
+                    f"{lpips_str:>10} {fid_str:>10} {m['avg_time']:>12.2f}\n")
 
         f.write("-" * 70 + "\n")
         avg_psnr = sum(all_psnrs) / len(all_psnrs) if all_psnrs else 0.0
         avg_ssim = sum(all_ssims) / len(all_ssims) if all_ssims else 0.0
         avg_lpips = sum(all_lpipss) / len(all_lpipss) if all_lpipss else float("nan")
         lpips_str = f"{avg_lpips:.4f}" if avg_lpips == avg_lpips else "  N/A  "
+        fid_overall_str = f"{overall_fid:.4f}" if overall_fid == overall_fid else "  N/A  "
         f.write(f"{'ALL':<12} {total_n:>5} {avg_psnr:>10.4f} {avg_ssim:>10.4f} "
-                f"{lpips_str:>10} {'-':>12}\n")
+                f"{lpips_str:>10} {fid_overall_str:>10} {'-':>12}\n")
         f.write("=" * 70 + "\n")
 
     # 终端打印汇总
-    print("\n" + "=" * 70)
-    print(f"{'Weather':<12} {'N':>5} {'PSNR (dB)':>10} {'SSIM':>10} {'LPIPS':>10}")
-    print("-" * 70)
+    print("\n" + "=" * 78)
+    print(f"{'Weather':<12} {'N':>5} {'PSNR (dB)':>10} {'SSIM':>10} {'LPIPS':>10} {'FID':>10}")
+    print("-" * 78)
     for weather in args_config["weather_types"]:
         if weather not in weather_metrics:
             continue
         m = weather_metrics[weather]
         lpips_str = f"{m['lpips']:.4f}" if m['lpips'] == m['lpips'] else "  N/A  "
-        print(f"{weather:<12} {m['n']:>5} {m['psnr']:>10.4f} {m['ssim']:>10.4f} {lpips_str:>10}")
-    print("-" * 70)
+        fid_str = f"{m.get('fid', float('nan')):.4f}" if m.get('fid', float('nan')) == m.get('fid', float('nan')) else "  N/A  "
+        print(f"{weather:<12} {m['n']:>5} {m['psnr']:>10.4f} {m['ssim']:>10.4f} {lpips_str:>10} {fid_str:>10}")
+    print("-" * 78)
     avg_lpips_str = f"{avg_lpips:.4f}" if avg_lpips == avg_lpips else "  N/A  "
-    print(f"{'ALL':<12} {total_n:>5} {avg_psnr:>10.4f} {avg_ssim:>10.4f} {avg_lpips_str:>10}")
-    print("=" * 70)
+    fid_overall_str = f"{overall_fid:.4f}" if overall_fid == overall_fid else "  N/A  "
+    print(f"{'ALL':<12} {total_n:>5} {avg_psnr:>10.4f} {avg_ssim:>10.4f} {avg_lpips_str:>10} {fid_overall_str:>10}")
+    print("=" * 78)
     print(f"\n[eval] 评估完成, 结果保存到: {eval_root}")
     print(f"[eval] 汇总指标: {summary_path}")
 

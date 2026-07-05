@@ -7,8 +7,10 @@ controlnet_model_path: "./experiment/ControlNetSR/checkpoint-50000"
 output_dir: "./experiment/eval"
 
 # ==================== 数据集配置 ====================
-# 与 train.yaml 相同的 dataset_root, 复用其目录结构
-dataset_root: "D:/Projects/pycharm/WeaFU-main/dataprocess"
+# 各天气类型的 test 集根目录 (相互独立)
+dataset_rain: "D:/Projects/pycharm/WeaFU-main/dataprocess/rain"
+dataset_snow: "D:/Projects/pycharm/WeaFU-main/dataprocess/snow"
+dataset_haze: "D:/Projects/pycharm/WeaFU-main/dataprocess/haze"
 # 待评估的天气类型
 weather_types: ["rain", "snow", "haze"]
 # 评估时使用 test 划分
@@ -56,3 +58,9 @@ save_predictions: true
 # ==================== LPIPS 配置 ====================
 # LPIPS 使用的 backbone: 'alex' | 'vgg' (默认 alex, 更快)
 lpips_net: "alex"
+
+# ==================== FID 配置 ====================
+# 是否启用 FID 指标计算 (InceptionV3 特征分布距离, 越低越好)
+# 首次运行时会自动下载 InceptionV3 权重 (~100MB) 到 ~/.cache/torch/hub/checkpoints/
+# 计算耗时较长, 调试时可关闭
+enable_fid: true
