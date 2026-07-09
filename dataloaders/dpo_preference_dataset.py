@@ -72,6 +72,7 @@ class DPOPreferenceDataset(data.Dataset):
         top_k_ratio: float = 0.30,
         bottom_k_ratio: float = 0.30,
         min_gap: float = 0.02,
+        normalize: bool = True,
         augment_geo: bool = True,
         geo_flip_prob: float = 0.5,
         geo_scale_range: Tuple[float, float] = (0.9, 1.1),
@@ -91,6 +92,7 @@ class DPOPreferenceDataset(data.Dataset):
         self.reward_weights = reward_weights or {
             "psnr": 0.25, "ssim": 0.25, "lpips": -0.30, "clip_iqa": 0.20,
         }
+        self.normalize = normalize
         self.top_k_ratio = max(0.0, min(1.0, top_k_ratio))
         self.bottom_k_ratio = max(0.0, min(1.0, bottom_k_ratio))
         self.min_gap = min_gap
@@ -232,17 +234,27 @@ class DPOPreferenceDataset(data.Dataset):
     # 加载候选 (内存优化: 一次性读全部 cand, score 已在 __init__ 时读入)
     # ============================================================
     def _load_candidates(self, sample: Dict) -> Tuple[List[Dict], List[torch.Tensor]]:
-        """读 score.json 并按当前 reward_weights 聚合分数; 按需加载候选图."""
+        """读 score.json 并按当前 reward_weights 聚合分数; 按需加载候选图.
+
+        聚合方式:
+          - 默认 (normalize=false): 简单加权和, 受 PSNR 等大数值指标主导
+          - normalize=true: 候选内 min-max 归一化后加权和, 各指标贡献与权重对齐,
+            lpips 因为越小越好自动翻转
+        """
         with open(sample["score_path"], "r", encoding="utf-8") as f:
             score_payload = json.load(f)
         cands_meta = score_payload["candidates"]
-        # 聚合分数 (score.json 中可能缺少某些指标字段, 用 .get 容错, 默认为 0)
-        scores = []
-        for c in cands_meta:
-            s = 0.0
-            for k, w in self.reward_weights.items():
-                s += w * c.get(k, 0.0)
-            scores.append(s)
+        # 候选内 min-max 归一化后加权和 (避免 PSNR 等数值大的指标主导)
+        if self.normalize:
+            scores = self._aggregate_normalized(cands_meta)
+        else:
+            # 简单加权和 (score.json 缺字段时容错默认 0)
+            scores = []
+            for c in cands_meta:
+                s = 0.0
+                for k, w in self.reward_weights.items():
+                    s += w * c.get(k, 0.0)
+                scores.append(s)
         scores_t = torch.tensor(scores)
 
         # Top-k / Bottom-k 池
@@ -255,6 +267,40 @@ class DPOPreferenceDataset(data.Dataset):
         bot_pool = order[:k_bot]         # 分数最小
 
         return cands_meta, scores_t, top_pool, bot_pool
+
+    def _aggregate_normalized(self, cands_meta: List[Dict]) -> List[float]:
+        """候选内 min-max 归一化后加权和.
+
+        流程:
+          1. 每个 metric 沿候选方向 min-max 归一到 [0, 1]
+          2. lpips 越小越好 → 翻转 (1 - norm)
+          3. 加权求和, 权重正则化到 sum(|w|)=1 不必要 (代码略),
+             实际只要各项不远离 0~1 即可
+
+        例: 候选 A,B,C 的 PSNR=[24, 27, 25], lpips=[0.3, 0.15, 0.2]
+             → norm_psnr=[0.0, 1.0, 0.33], norm_lpips=[0.0, 1.0, 0.67]
+             → 翻转 lpips (越小越好): [1.0, 0.0, 0.33]
+        """
+        from math import isclose
+        n = len(cands_meta)
+        scores = [0.0] * n
+        for m, w in self.reward_weights.items():
+            if abs(w) < 1e-12:
+                continue
+            vals = [c.get(m, 0.0) for c in cands_meta]
+            if not vals:
+                continue
+            lo, hi = min(vals), max(vals)
+            if isclose(hi, lo, abs_tol=1e-9):
+                norm = [0.5] * n      # 全相同, 中性贡献
+            else:
+                norm = [(v - lo) / (hi - lo) for v in vals]
+            # lpips 越小越好 → 翻转
+            if m == "lpips":
+                norm = [1.0 - v for v in norm]
+            for i, v in enumerate(norm):
+                scores[i] += w * v
+        return scores
 
     # ============================================================
     # 弱偏好过滤 + 抽样

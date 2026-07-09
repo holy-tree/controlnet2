@@ -608,6 +608,15 @@ def parse_args(input_args=None):
         help="loser 池: 聚合分数后 k%% 候选",
     )
     parser.add_argument(
+        "--normalize_reward", action="store_true",
+        default=True,
+        help="训练时聚合 reward 先做候选内 min-max 归一化 (避免 PSNR 主导)",
+    )
+    parser.add_argument(
+        "--no_normalize_reward", dest="normalize_reward", action="store_false",
+        help="禁用候选内 min-max 归一化 (使用简单加权和)",
+    )
+    parser.add_argument(
         "--min_gap", type=float, default=0.02,
         help="winner/loser 聚合分数之差小于该值则视为弱偏好, 跳过",
     )
@@ -1131,6 +1140,7 @@ def main(args):
             top_k_ratio=args.top_k_ratio,
             bottom_k_ratio=args.bottom_k_ratio,
             min_gap=args.min_gap,
+            normalize=args.normalize_reward,
             augment_geo=args.augment_geo,
             geo_flip_prob=args.geo_flip_prob,
             geo_scale_range=(args.geo_scale_low, args.geo_scale_high),
