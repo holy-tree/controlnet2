@@ -55,8 +55,17 @@ from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
 from dataloaders.paired_dataset import PairedCaptionDataset
+from dataloaders.dpo_preference_dataset import (
+    DPOPreferenceDataset,
+    collate_fn_dpo,
+)
 
 from ramseesr.utils.metrics import psnr as calc_psnr, ssim as calc_ssim
+
+from utils.dpo import (
+    build_ref_controlnet,
+    compute_dpo_loss,
+)
 
 from typing import Mapping, Any
 from torchvision import transforms
@@ -568,6 +577,73 @@ def parse_args(input_args=None):
     parser.add_argument("--ram_ft_path", type=str, default=None)
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config file")
 
+    # ==================== DPO 相关参数 ====================
+    parser.add_argument(
+        "--train_method", type=str, default="sft",
+        choices=["sft", "dpo"],
+        help="训练阶段: sft=标准 MSE 监督训练 (默认), dpo=偏好优化",
+    )
+    parser.add_argument(
+        "--sft_controlnet_ckpt", type=str, default=None,
+        help="DPO 阶段加载的 SFT 训练好的 controlnet 权重目录 (含 diffusion_pytorch_model.bin)",
+    )
+    parser.add_argument(
+        "--beta_dpo", type=float, default=5000.0,
+        help="DPO KL 强度 (Wallace et al. 2023 默认 5000)",
+    )
+    parser.add_argument(
+        "--sft_loss_weight", type=float, default=0.0,
+        help="可选: 在 DPO 损失上叠加 GT 监督 MSE 损失, 防止 reward hacking",
+    )
+    parser.add_argument(
+        "--candidates_subdir", type=str, default="candidates",
+        help="build_preference.py 写出的候选子目录名",
+    )
+    parser.add_argument(
+        "--top_k_ratio", type=float, default=0.30,
+        help="winner 池: 聚合分数前 k%% 候选",
+    )
+    parser.add_argument(
+        "--bottom_k_ratio", type=float, default=0.30,
+        help="loser 池: 聚合分数后 k%% 候选",
+    )
+    parser.add_argument(
+        "--min_gap", type=float, default=0.02,
+        help="winner/loser 聚合分数之差小于该值则视为弱偏好, 跳过",
+    )
+    parser.add_argument(
+        "--reward_weight_psnr", type=float, default=0.25,
+        help="reward 聚合权重: PSNR (越大越好)",
+    )
+    parser.add_argument(
+        "--reward_weight_ssim", type=float, default=0.25,
+        help="reward 聚合权重: SSIM (越大越好)",
+    )
+    parser.add_argument(
+        "--reward_weight_lpips", type=float, default=-0.30,
+        help="reward 聚合权重: LPIPS (越小越好, 权重应为负)",
+    )
+    parser.add_argument(
+        "--reward_weight_clip_iqa", type=float, default=0.20,
+        help="reward 聚合权重: CLIP-IQA (越大越好)",
+    )
+    parser.add_argument(
+        "--augment_geo", action="store_true",
+        help="DPO 阶段启用几何增强 (Flip/Scale/CenterCrop), 严禁颜色增强",
+    )
+    parser.add_argument(
+        "--geo_flip_prob", type=float, default=0.5,
+        help="几何增强: 水平翻转概率",
+    )
+    parser.add_argument(
+        "--geo_scale_low", type=float, default=0.9,
+        help="几何增强: 短边随机缩放下限",
+    )
+    parser.add_argument(
+        "--geo_scale_high", type=float, default=1.1,
+        help="几何增强: 短边随机缩放上限",
+    )
+
     # 新增:三层嵌套数据集配置
     parser.add_argument("--dataset_root", type=str, default="./datasets",
                         help="数据集根目录, 结构: {dataset_root}/{weather}/{split}/{GT,LQ}/")
@@ -1008,6 +1084,26 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
+    # ==================== DPO: ref_controlnet 构建 ====================
+    # 仅在 train_method=dpo 时启用:
+    #   1. 加载 SFT 阶段训练好的 controlnet 权重
+    #   2. 深拷贝一份作为 ref_controlnet, 冻结, eval, 不参与 optimizer / accelerator.prepare
+    ref_controlnet = None
+    if args.train_method == "dpo":
+        if args.sft_controlnet_ckpt:
+            logger.info(f"[DPO] 加载 SFT controlnet 权重 from {args.sft_controlnet_ckpt}")
+            # 从原版 unet 初始化结构 (与 main 顶部的 controlnet 一致), 然后 load_state_dict
+            sft_cn = ControlNetModel.from_pretrained(args.sft_controlnet_ckpt)
+            controlnet.load_state_dict(sft_cn.state_dict())
+            del sft_cn
+        else:
+            logger.warning(
+                "[DPO] 未指定 --sft_controlnet_ckpt, "
+                "将使用当前初始化的 controlnet 作为 ref_controlnet 起点"
+            )
+        ref_controlnet = build_ref_controlnet(controlnet)
+        logger.info("[DPO] ref_controlnet 已构建 (frozen, eval mode)")
+
     # 按 weather 限制样本数: 优先用 args.<weather>_num, 否则不限制
     weather_num_samples = {}
     for w in args.weather_types:
@@ -1017,24 +1113,55 @@ def main(args):
             if v is not None and v > 0:
                 weather_num_samples[w] = v
 
-    train_dataset = PairedCaptionDataset(
-        dataset_root=args.dataset_root,
-        weather_types=args.weather_types,
-        splits=args.splits,
-        tokenizer=tokenizer,
-        null_text_ratio=args.null_text_ratio,
-        use_prompt=args.use_prompt,
-        prompt_ratio=args.prompt_ratio,
-        weather_prompts=weather_prompts_dict,
-        resolution=args.resolution,
-        weather_num_samples=weather_num_samples,
-    )
+    if args.train_method == "dpo":
+        reward_weights = {
+            "psnr":     args.reward_weight_psnr,
+            "ssim":     args.reward_weight_ssim,
+            "lpips":    args.reward_weight_lpips,
+            "clip_iqa": args.reward_weight_clip_iqa,
+        }
+        train_dataset = DPOPreferenceDataset(
+            dataset_root=args.dataset_root,
+            weather_types=args.weather_types,
+            splits=args.splits,
+            tokenizer=tokenizer,
+            resolution=args.resolution,
+            candidates_subdir=args.candidates_subdir,
+            reward_weights=reward_weights,
+            top_k_ratio=args.top_k_ratio,
+            bottom_k_ratio=args.bottom_k_ratio,
+            min_gap=args.min_gap,
+            augment_geo=args.augment_geo,
+            geo_flip_prob=args.geo_flip_prob,
+            geo_scale_range=(args.geo_scale_low, args.geo_scale_high),
+            null_text_ratio=args.null_text_ratio,
+            use_prompt=args.use_prompt,
+            prompt_ratio=args.prompt_ratio,
+            weather_prompts=weather_prompts_dict,
+            weather_num_samples=weather_num_samples,
+        )
+        train_collate_fn = collate_fn_dpo
+    else:
+        train_dataset = PairedCaptionDataset(
+            dataset_root=args.dataset_root,
+            weather_types=args.weather_types,
+            splits=args.splits,
+            tokenizer=tokenizer,
+            null_text_ratio=args.null_text_ratio,
+            use_prompt=args.use_prompt,
+            prompt_ratio=args.prompt_ratio,
+            weather_prompts=weather_prompts_dict,
+            resolution=args.resolution,
+            weather_num_samples=weather_num_samples,
+        )
+        train_collate_fn = None
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         num_workers=args.dataloader_num_workers,
         batch_size=args.train_batch_size,
-        shuffle=True
+        shuffle=True,
+        collate_fn=train_collate_fn,
     )
 
 
@@ -1072,6 +1199,10 @@ def main(args):
     unet.to(accelerator.device, dtype=weight_dtype)
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     # RAM.to(accelerator.device, dtype=weight_dtype)
+
+    # ==================== DPO: ref_controlnet 同步到 device / dtype ====================
+    if ref_controlnet is not None:
+        ref_controlnet.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1167,6 +1298,13 @@ def main(args):
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
+                # ==================== DPO 关键不变量 ====================
+                # winner / loser 必须共享同一 timestep / noise, 否则 DPO 损失会爆炸.
+                # collate_fn_dpo 已沿 batch 维把 winner/loser 拼成 [2*B, ...], 这里强制对齐.
+                if args.train_method == "dpo":
+                    timesteps = timesteps.chunk(2, dim=0)[0].repeat(2)
+                    noise = noise.chunk(2, dim=0)[0].repeat(2, 1, 1, 1)
+
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
@@ -1202,7 +1340,81 @@ def main(args):
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
                 else:
                     raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                if args.train_method == "dpo":
+                    # ---------- DPO 损失 ----------
+                    # 1) ref_controlnet 前向 (no_grad)
+                    with torch.no_grad():
+                        down_res_ref, mid_res_ref = ref_controlnet(
+                            noisy_latents,
+                            timesteps,
+                            encoder_hidden_states=encoder_hidden_states,
+                            controlnet_cond=controlnet_image,
+                            return_dict=False,
+                        )
+                        ref_pred = unet(
+                            noisy_latents,
+                            timesteps,
+                            encoder_hidden_states=encoder_hidden_states,
+                            down_block_additional_residuals=[
+                                s.to(dtype=weight_dtype) for s in down_res_ref
+                            ],
+                            mid_block_additional_residual=mid_res_ref.to(dtype=weight_dtype),
+                        ).sample
+
+                    loss_dpo, implicit_acc, _ = compute_dpo_loss(
+                        model_pred, ref_pred, target, beta_dpo=args.beta_dpo,
+                    )
+
+                    # 2) 可选: SFT 正则 (用 GT 做 MSE, 防止 reward hacking)
+                    if args.sft_loss_weight > 0.0:
+                        # 选取 winner 部分 [B] 与 GT [B] 算 MSE
+                        model_pred_winner = model_pred.chunk(2, dim=0)[0]
+                        # GT 的 latent 在 chunk(2) 之后只有 B, 需要让 dataloader 提供 GT
+                        if "pixel_values_gt" in batch:
+                            gt_pixels = batch["pixel_values_gt"].to(
+                                accelerator.device, dtype=weight_dtype
+                            )
+                            gt_latents = (
+                                vae.encode(gt_pixels).latent_dist.sample()
+                                * vae.config.scaling_factor
+                            )
+                            gt_noise = torch.randn_like(gt_latents)
+                            gt_t = torch.randint(
+                                0, noise_scheduler.config.num_train_timesteps,
+                                (gt_latents.shape[0],), device=latents.device,
+                            ).long()
+                            gt_noisy = noise_scheduler.add_noise(
+                                gt_latents, gt_noise, gt_t,
+                            )
+                            # 用 winner 的 encoder_hidden_states / lq 重新前向
+                            enc_w = encoder_hidden_states.chunk(2, dim=0)[0]
+                            lq_w = controlnet_image.chunk(2, dim=0)[0]
+                            d_w, m_w = controlnet(
+                                gt_noisy, gt_t,
+                                encoder_hidden_states=enc_w,
+                                controlnet_cond=lq_w,
+                                return_dict=False,
+                            )
+                            pred_gt = unet(
+                                gt_noisy, gt_t,
+                                encoder_hidden_states=enc_w,
+                                down_block_additional_residuals=[
+                                    s.to(dtype=weight_dtype) for s in d_w
+                                ],
+                                mid_block_additional_residual=m_w.to(dtype=weight_dtype),
+                            ).sample
+                            loss_sft = F.mse_loss(
+                                pred_gt.float(), gt_noise.float(), reduction="mean"
+                            )
+                            loss = loss_dpo + args.sft_loss_weight * loss_sft
+                        else:
+                            loss = loss_dpo
+                    else:
+                        loss = loss_dpo
+                else:
+                    # ---------- SFT 损失 (沿用原版) ----------
+                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1257,6 +1469,8 @@ def main(args):
                         )
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            if args.train_method == "dpo":
+                logs["implicit_acc"] = float(implicit_acc.detach().item())
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 

@@ -1,0 +1,115 @@
+# =====================================================================
+# ControlNet-DPO 偏好优化训练配置
+# =====================================================================
+# 使用方法:
+#   1. 先用 scripts/build_preference.py 离线采样 N 个候选并打 4 维 reward
+#   2. 加载 SFT 训练好的 controlnet 权重, 用本配置启动 DPO 微调
+#   3. 调 reward_weights 只需修改本 yaml, 无需重采样
+
+# -------- 模型与权重 --------
+pretrained_model_name_or_path: "sd-research/stable-diffusion-2-base"
+# SFT 阶段训练好的 controlnet 权重目录 (含 diffusion_pytorch_model.bin)
+sft_controlnet_ckpt: "./experiment/ControlNetSR/checkpoint-50000/controlnet"
+output_dir: "./experiment/ControlNetDPO"
+
+# -------- 数据集根目录 (沿用 SFT 阶段结构: GT / LQ 在这里) --------
+# dataset_root/{weather}/{split}/{GT,LQ}/
+dataset_root: "D:/Projects/pycharm/WeaFU-main/dataprocess"
+# 候选路径 (与 build_preference.yaml 的 candidates_subdir 一致)
+candidates_subdir: "D:/Projects/pycharm/controlnet_file/experiment/candidates"
+weather_types: ["rain", "snow", "haze"]
+splits: ["train"]
+# 每种天气使用的样本数 (None 或 0 表示不限制)
+snow_num: 2
+rain_num: 2
+haze_num: 2
+
+# ==================== Reward 配置 ====================
+# 每条 (LQ) 离线采样得到的候选数 N
+num_candidates: 3
+# 4 维 reward 权重 (注意: lpips 越小越好, 权重为负)
+# 可在线调整, 不会触发重采样
+reward_weights:
+  psnr: 0.25
+  ssim: 0.25
+  lpips: -0.30
+#  clip_iqa: 0.20
+# Top-k% / Bottom-k% 池内随机抽 winner / loser
+top_k_ratio: 0.50
+bottom_k_ratio: 0.50
+# 最小偏好间隔 (聚合分数之差), 弱偏好样本会被跳过
+min_gap: 0.02
+
+# ==================== Prompt 配置 (与 SFT 保持一致) ====================
+use_prompt: false
+prompt_ratio: 0.2
+weather_prompts:
+  rain: "rainy scene, rain streaks on the image, wet surfaces, overcast sky"
+  snow: "snowy scene, snowflakes covering the image, cold atmosphere, white noise"
+  haze: "hazy scene, foggy atmosphere, low visibility, grayish tone"
+
+# ==================== 几何增强 (只 Flip / Scale / CenterCrop) ====================
+# 严禁颜色增强 (ColorJitter/Brightness/Contrast) -- 会破坏恢复任务监督基准
+augment_geo: true
+geo_flip_prob: 0.5
+geo_scale_range: [0.9, 1.1]   # 短边随机缩放, 之后 CenterCrop 回原分辨率
+
+# ==================== 训练超参数 ====================
+train_batch_size: 1             # DPO 阶段建议 BS=1
+gradient_accumulation_steps: 8
+learning_rate: 1.0e-6           # DPO 比 SFT 低 1~2 个数量级
+lr_scheduler: "constant_with_warmup"
+lr_warmup_steps: 200
+max_train_steps: 3
+checkpointing_steps: 1
+dataloader_num_workers: 0
+null_text_ratio: 0.0            # DPO 必须关闭 CFG, 避免 prompt 污染
+
+# ==================== DPO 核心超参 ====================
+beta_dpo: 1000.0                # KL 强度, 与 SD-DPO 论文一致
+sft_loss_weight: 0.0            # 可选: loss_dpo + sft_loss_weight * loss_sft
+implicit_acc_log_every: 50      # 每 N 步 log 一次 implicit_acc
+ema_ref_controlnet: false       # 是否对 ref_controlnet 启用 EMA 同步
+ema_decay: 0.999
+
+# ==================== 其他 (与 SFT 保持一致) ====================
+enable_xformers_memory_efficient_attention: false
+mixed_precision: "fp16"
+resolution: 512
+gradient_checkpointing: true
+seed: 42
+revision: null
+variant: null
+tokenizer_name: null
+cache_dir: null
+num_train_epochs: 1000
+checkpoints_total_limit: null
+resume_from_checkpoint: null
+scale_lr: false
+lr_num_cycles: 1
+lr_power: 1.0
+use_8bit_adam: false
+adam_beta1: 0.9
+adam_beta2: 0.999
+adam_weight_decay: 0.01
+adam_epsilon: 1e-08
+max_grad_norm: 1.0
+push_to_hub: false
+hub_token: null
+hub_model_id: null
+logging_dir: "logs"
+allow_tf32: false
+report_to: "tensorboard"
+tracker_project_name: "train_controlnet_DPO"
+set_grads_to_none: true
+
+# 验证
+run_validation: false
+validation_num_samples: 2
+validation_inference_steps: 20
+validation_guidance_scale: 5.5
+validation_negative_prompt: "dotted, noise, blur, lowres, smooth"
+validation_prompt: null
+validation_image: null
+num_validation_images: 2
+validation_steps: 500

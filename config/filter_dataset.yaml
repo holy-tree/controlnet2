@@ -1,0 +1,30 @@
+# =====================================================================
+# Sobel 细节筛选配置 (流水线步骤 1)
+# 用于 scripts/filter_dataset/filter_by_sobel.py
+# =====================================================================
+# 启动方式:
+#   python scripts/filter_dataset/filter_by_sobel.py --config config/filter_dataset.yaml
+# =====================================================================
+
+# GT 根目录 (与 train.yaml 中的 dataset_root 一致)
+#   多天气模式: 结构必须为 {gt_root}/{weather}/{split}/GT/
+gt_root: "D:/Projects/pycharm/WeaFU-main/dataprocess"
+
+# 多天气模式: 每种天气各取 top_k
+weather_types: ["rain", "snow", "haze"]
+splits: ["train"]
+
+# 输出 JSON 路径, 后续 build_preference.py 通过 --filtered_json 复用
+output_json: "D:/Projects/pycharm/controlnet_file/experiment/filtered/top7000_per_weather.json"
+
+# 每种天气保留前 N 张 (按 Sobel mean 降序)
+top_k: 3
+
+# reward 指标
+metric: "mean"               # mean / std / mean_std
+
+# 计算参数
+num_workers: 8               # 并行 worker 数
+resize: null                 # 短边 resize (加速; null 不缩放)
+min_score: null              # 最低分数阈值 (null 不过滤)
+save_scores: false           # 是否写全量分数到 JSON (debug 用)

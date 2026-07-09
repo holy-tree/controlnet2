@@ -1,0 +1,55 @@
+# 偏好对构建 (DPO 第二步) 用 Yaml 配置
+# 用于 scripts/build_preference.py
+
+# 候选生成 pipeline
+# 留空时使用 args.pretrained_model_name_or_path + args.controlnet_model_name_or_path
+pretrained_model_name_or_path: "sd-research/stable-diffusion-2-base"
+controlnet_model_name_or_path: "./experiment/ControlNetSR/checkpoint-50000/controlnet"
+
+# 数据集
+# dataset_root: 当 filtered_json 未指定时, 按 {dataset_root}/{weather}/{split}/{GT,LQ}/ 扫描
+# filtered_json: 当指定时, 从该 JSON (脚本 filter_dataset/filter_by_sobel.py 输出) 读取 GT 路径,
+#                并按 weather 分别处理. 二选一, filtered_json 优先.
+filtered_json: "D:/Projects/pycharm/controlnet_file/experiment/filtered/top7000_per_weather.json"
+# dataset_root: "D:/Projects/pycharm/WeaFU-main/dataprocess"
+weather_types: ["rain", "snow", "haze"]
+splits: ["train"]
+snow_num: 0
+rain_num: 0
+haze_num: 0
+
+# 采样配置
+num_candidates: 3               # 每条 (LQ) 采样多少张候选
+inference_steps: 20
+guidance_scale: 1.0              # 构建偏好对时不使用 CFG, 避免 prompt 干扰
+height: 512
+width: 512
+seed_base: 0                     # candidate[i] 用 seed_base + i
+mixed_precision: "fp16"
+
+# 输出
+# 候选保存路径
+#   - 相对路径: 拼到 dataset_root/{weather}/{split}/candidates/{stem}/ 下 (旧行为)
+#   - 绝对路径: 直接用该路径, 再追加 {weather}/{split}/{stem}/
+candidates_subdir: "D:/Projects/pycharm/controlnet_file/experiment/candidates"
+
+# 评分配置 (4 维 reward, 全量写入 score.json)
+reward_metrics:
+  - psnr
+  - ssim
+  - lpips
+#  - clip_iqa
+
+# 用于初次排序的默认权重 (最终训练时的权重从 dpo.yaml 注入)
+reward_weights:
+  psnr: 0.25
+  ssim: 0.25
+  lpips: -0.30
+  clip_iqa: 0.20
+
+# 是否复用已存在的候选 (resume 模式)
+# 设为 true 时, 跳过 cand_*.png 重新采样, 仅重算 score.json
+rescore_only: false
+
+# 仅跑部分样本, 用于快速验证
+max_samples: null                # null 表示不限制
