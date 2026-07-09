@@ -19,7 +19,8 @@ rain_num: 0
 haze_num: 0
 
 # 采样配置
-num_candidates: 3               # 每条 (LQ) 采样多少张候选
+num_candidates: 16               # 每条 (LQ) 采样多少张候选
+sample_batch_size: 4             # 每个 pipeline 调用同时采样的候选数 (越大越快, 显存够可调到 8~16)
 inference_steps: 20
 guidance_scale: 1.0              # 构建偏好对时不使用 CFG, 避免 prompt 干扰
 height: 512

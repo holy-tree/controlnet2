@@ -110,38 +110,77 @@ class RewardScorer:
                           候选: "psnr" / "ssim" / "lpips" / "clip_iqa"
         返回:
             dict of {metric_name: list[float]}, 长度 = len(cand_tensors)
+            含 NaN/Inf 像素的候选: 所有指标都返回 nan, 由 process_one_sample 过滤
             未启用的指标不出现在结果中
         """
         if metrics is None:
             metrics = ["psnr", "ssim", "lpips", "clip_iqa"]
         results = {m: [] for m in metrics}
+        n = len(cand_tensors)
 
-        # 1) PSNR / SSIM (逐张)
+        # 预处理: 标记哪些候选含 NaN/Inf 像素 (跳过其 reward 计算, 全部填 nan)
+        valid_mask = [bool(torch.isfinite(c).all().item()) for c in cand_tensors]
+
+        # 1) PSNR / SSIM (逐张; 仅对 valid_mask[i]=True 的算)
         if "psnr" in metrics or "ssim" in metrics:
-            for c in cand_tensors:
-                if "psnr" in metrics:
-                    results["psnr"].append(calc_psnr(c, gt_tensor))
-                if "ssim" in metrics:
-                    results["ssim"].append(calc_ssim(c, gt_tensor))
+            for i, c in enumerate(cand_tensors):
+                if not valid_mask[i]:
+                    if "psnr" in metrics: results["psnr"].append(float("nan"))
+                    if "ssim" in metrics: results["ssim"].append(float("nan"))
+                    continue
+                try:
+                    if "psnr" in metrics:
+                        results["psnr"].append(calc_psnr(c, gt_tensor))
+                    if "ssim" in metrics:
+                        results["ssim"].append(calc_ssim(c, gt_tensor))
+                except Exception as e:
+                    logger.debug(f"PSNR/SSIM 失败 (cand {i}): {e}")
+                    if "psnr" in metrics: results["psnr"].append(float("nan"))
+                    if "ssim" in metrics: results["ssim"].append(float("nan"))
 
-        # 2) LPIPS (逐张)
+        # 2) LPIPS (逐张; 仅算 valid, 模型失败也写 nan)
         if "lpips" in metrics:
-            lpips_model = self._ensure_lpips()
-            gt_in = (gt_tensor.unsqueeze(0) * 2 - 1).to(self.device, self.dtype)
-            for c in cand_tensors:
-                c_in = (c.unsqueeze(0) * 2 - 1).to(self.device, self.dtype)
-                d = lpips_model(c_in, gt_in)
-                results["lpips"].append(float(d.mean().item()))
+            try:
+                lpips_model = self._ensure_lpips()
+                gt_in = (gt_tensor.unsqueeze(0) * 2 - 1).to(self.device, self.dtype)
+                for i, c in enumerate(cand_tensors):
+                    if not valid_mask[i]:
+                        results["lpips"].append(float("nan"))
+                        continue
+                    try:
+                        c_in = (c.unsqueeze(0) * 2 - 1).to(self.device, self.dtype)
+                        d = lpips_model(c_in, gt_in)
+                        results["lpips"].append(float(d.mean().item()))
+                    except Exception as e:
+                        logger.debug(f"LPIPS 失败 (cand {i}): {e}")
+                        results["lpips"].append(float("nan"))
+            except Exception as e:
+                logger.warning(f"LPIPS 模型加载失败: {e}")
+                for _ in range(n):
+                    results["lpips"].append(float("nan"))
 
-        # 3) CLIP-IQA (无参考, 越大越好)
+        # 3) CLIP-IQA (无参考; 仅对 valid 的 batch 处理)
         if "clip_iqa" in metrics:
-            clipiqa = self._ensure_clipiqa()
-            batch = torch.stack(cand_tensors, dim=0).to(self.device)
-            iqa_scores = clipiqa(batch)
-            if iqa_scores.ndim == 0:
-                results["clip_iqa"] = [float(iqa_scores.item())] * len(cand_tensors)
-            else:
-                results["clip_iqa"] = [float(s) for s in iqa_scores.cpu().tolist()]
+            iqa_scores = [float("nan")] * n
+            valid_indices = [i for i in range(n) if valid_mask[i]]
+            if valid_indices:
+                try:
+                    clipiqa = self._ensure_clipiqa()
+                    batch = torch.stack(
+                        [cand_tensors[i] for i in valid_indices], dim=0
+                    ).to(self.device)
+                    scores_tensor = clipiqa(batch)
+                    scores_list = (
+                        [float(scores_tensor.item())] * len(valid_indices)
+                        if scores_tensor.ndim == 0
+                        else [float(s) for s in scores_tensor.cpu().tolist()]
+                    )
+                    for idx, s in zip(valid_indices, scores_list):
+                        iqa_scores[idx] = s
+                except Exception as e:
+                    logger.warning(f"CLIP-IQA 失败: {e}")
+                    # iqa_scores 已默认全 nan
+            results["clip_iqa"] = iqa_scores
 
         # 严格只保留 metrics 中列出的 (避免意外多余键)
         return {m: results[m] for m in metrics}
@@ -388,45 +427,81 @@ def process_one_sample(pipeline, scorer, sample, args, weight_dtype, device, ena
 
     cand_tensors = []
     skip_sampling = args.rescore_only
+    sample_bs = max(1, getattr(args, "sample_batch_size", 4))
 
-    for i in range(args.num_candidates):
-        cand_path = cand_root / f"cand_{i:03d}.png"
-        if skip_sampling and cand_path.is_file():
-            pil = Image.open(cand_path).convert("RGB")
-            cand_tensors.append(to_tensor(pil))
-            continue
+    # 分批采样: 每次把 sample_bs 张候选打包成一个 pipeline 调用
+    #   - generator 列表保证每张图噪声独立 → 多样性不损失
+    #   - prompt/image 列表长度统一为 sample_bs
+    i = 0
+    while i < args.num_candidates:
+        end = min(i + sample_bs, args.num_candidates)
+        batch_indices = list(range(i, end))
 
-        generator = torch.Generator(device=device).manual_seed(args.seed_base + i)
-        with torch.autocast("cuda", enabled=(weight_dtype != torch.float32)):
-            out = pipeline(
-                prompt="",
-                image=lq_pil,
-                num_inference_steps=args.inference_steps,
-                guidance_scale=args.guidance_scale,
-                generator=generator,
-                height=args.height,
-                width=args.width,
-            ).images[0]
-        out = out.resize((args.width, args.height), Image.BILINEAR)
-        out.save(cand_path)
-        cand_tensors.append(to_tensor(out))
+        all_cached = skip_sampling and all(
+            (cand_root / f"cand_{idx:03d}.png").is_file() for idx in batch_indices
+        )
+
+        if all_cached:
+            for idx in batch_indices:
+                cand_path = cand_root / f"cand_{idx:03d}.png"
+                cand_tensors.append(
+                    to_tensor(Image.open(cand_path).convert("RGB"))
+                )
+        else:
+            prompts = [""] * len(batch_indices)
+            images  = [lq_pil] * len(batch_indices)
+            generators = [
+                torch.Generator(device=device).manual_seed(args.seed_base + idx)
+                for idx in batch_indices
+            ]
+            with torch.autocast("cuda", enabled=(weight_dtype != torch.float32)):
+                outs = pipeline(
+                    prompt=prompts,
+                    image=images,
+                    num_inference_steps=args.inference_steps,
+                    guidance_scale=args.guidance_scale,
+                    generator=generators,
+                    height=args.height,
+                    width=args.width,
+                ).images  # list[PIL.Image]
+            for idx, out in zip(batch_indices, outs):
+                out = out.resize((args.width, args.height), Image.BILINEAR)
+                cand_path = cand_root / f"cand_{idx:03d}.png"
+                out.save(cand_path)
+                cand_tensors.append(to_tensor(out))
+
+        i = end
 
     # 按 args.reward_metrics 启用的项计算 reward
     rewards = scorer.score_all(cand_tensors, gt_tensor, metrics=enabled)
+
+    # 仅保留全部指标 finite 的候选 (过滤 NaN / Inf)
+    valid_idx = [
+        k for k in range(len(cand_tensors))
+        if all(np.isfinite(rewards[m][k]) for m in enabled)
+    ]
+    n_total = len(cand_tensors)
+    n_valid = len(valid_idx)
+    if n_valid < 2:
+        logger.warning(
+            f"[{weather}/{stem}] valid candidates = {n_valid}/{n_total} (< 2), 整条跳过"
+        )
+        return None
 
     score_payload = {
         "stem": stem,
         "weather": weather,
         "split": split,
-        "num_candidates": len(cand_tensors),
+        "num_candidates": n_valid,
+        "num_candidates_total": n_total,
         "reward_metrics_enabled": enabled,
         "reward_weights_default": args.reward_weights,  # 默认权重, 实际训练可覆盖
         "candidates": [
             {
-                "idx": i,
-                **{m: rewards[m][i] for m in enabled},
+                "idx": int(k),
+                **{m: float(rewards[m][k]) for m in enabled},
             }
-            for i in range(len(cand_tensors))
+            for k in valid_idx
         ],
     }
 
@@ -452,6 +527,12 @@ def parse_args():
     parser.add_argument("--rescore_only", action="store_true")
     parser.add_argument("--enable_xformers", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--sample_batch_size", type=int, default=None,
+        help="每次 pipeline 调用同时采样的候选数 (默认 4). "
+             "显存够时可调到 8~16 以大幅加速; "
+             "guidance_scale=1.0 时显存占用近似线性",
+    )
     parser.add_argument(
         "--filtered_json", type=str, default=None,
         help="sobel 筛选后的 JSON 路径 (来自 scripts/filter_dataset/filter_by_sobel.py). "
@@ -488,6 +569,8 @@ def main():
         args.rescore_only = False
     if not hasattr(args, "filtered_json"):
         args.filtered_json = None
+    if not hasattr(args, "sample_batch_size") or args.sample_batch_size is None:
+        args.sample_batch_size = 4
 
     # weather_num_samples 整合为 dict
     weather_num_samples = {}
@@ -550,13 +633,22 @@ def main():
     logger.info(f"Reward 模型加载完成 ({', '.join(enabled)})")
 
     # 逐条处理
-    summary = {"num_processed": 0, "num_skipped": 0, "elapsed_sec": 0.0}
+    summary = {
+        "num_processed": 0,
+        "num_skipped_error": 0,
+        "num_skipped_weak": 0,    # NaN / valid < 2
+        "sample_batch_size": args.sample_batch_size,
+        "elapsed_sec": 0.0,
+    }
     t0 = time.time()
     for idx, s in enumerate(samples):
         try:
             payload = process_one_sample(
                 pipeline, scorer, s, args, weight_dtype, device, enabled,
             )
+            if payload is None:
+                summary["num_skipped_weak"] += 1
+                continue
             summary["num_processed"] += 1
             if (idx + 1) % 20 == 0 or idx == 0:
                 # 打印 Top-1 / Bottom-1 简单检查
@@ -564,18 +656,16 @@ def main():
                     sum(c[m] * args.reward_weights.get(m, 0) for m in enabled)
                     for c in payload["candidates"]
                 ]
-
-
-
                 best = max(scores)
                 worst = min(scores)
                 logger.info(
                     f"[{idx+1}/{len(samples)}] {s['weather']}/{s['stem']}  "
-                    f"score_range=[{worst:.3f}, {best:.3f}]  gap={best-worst:.3f}"
+                    f"score_range=[{worst:.3f}, {best:.3f}]  gap={best-worst:.3f}  "
+                    f"valid={payload['num_candidates']}/{payload['num_candidates_total']}"
                 )
         except Exception as e:
             logger.exception(f"处理 {s['stem']} 失败: {e}")
-            summary["num_skipped"] += 1
+            summary["num_skipped_error"] += 1
 
     summary["elapsed_sec"] = time.time() - t0
     logger.info(f"完成. summary = {summary}")
