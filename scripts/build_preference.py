@@ -30,6 +30,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+import numpy as np
 import yaml
 from PIL import Image
 from torchvision import transforms
