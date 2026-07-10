@@ -372,6 +372,11 @@ def process_batch(pipeline, scorer, batch_samples, args,
     lq_batch = torch.stack(lq_tensors, dim=0).to(device)   # [B, 3, H, W]
     gt_batch = torch.stack(gt_tensors, dim=0).to(device)   # [B, 3, H, W]
 
+    # ===== 1b. 确保所有候选目录存在 (并行 mkdir, 不重复) =====
+    unique_cand_dirs = list(set(info["cand_dir"] for info in samples_meta))
+    with ThreadPoolExecutor(max_workers=min(8, len(unique_cand_dirs) or 1)) as ex:
+        list(ex.map(lambda d: d.mkdir(parents=True, exist_ok=True), unique_cand_dirs))
+
     # ===== 2. cache 检查 =====
     save_workers = max(2, min(8, BN))
     all_cached = args.rescore_only and all(
