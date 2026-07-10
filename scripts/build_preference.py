@@ -467,6 +467,15 @@ def process_batch(pipeline, scorer, batch_samples, args,
             if not valid_mask[flat_idx]:
                 continue
             cand_record = {"idx": j}
+            # 收集 reward 分数, 顺便检查有限性, 任何一个 NaN/Inf 跳过整条
+            score_vals = []
+            if psnr_scores is not None: score_vals.append(psnr_scores[flat_idx])
+            if ssim_scores is not None: score_vals.append(ssim_scores[flat_idx])
+            if lpips_scores is not None: score_vals.append(lpips_scores[flat_idx])
+            if clip_scores is not None: score_vals.append(clip_scores[flat_idx])
+            if not all(np.isfinite(v) for v in score_vals):
+                continue
+            # 都 finite, 写入
             if psnr_scores is not None: cand_record["psnr"] = psnr_scores[flat_idx]
             if ssim_scores is not None: cand_record["ssim"] = ssim_scores[flat_idx]
             if lpips_scores is not None: cand_record["lpips"] = lpips_scores[flat_idx]
@@ -484,8 +493,9 @@ def process_batch(pipeline, scorer, batch_samples, args,
             "candidates": candidates,
         }
         score_path = info["cand_dir"] / "score.json"
+        # allow_nan=False: 兜底, 如果有 NaN 漏过会抛 ValueError, 不会写 invalid JSON
         with open(score_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
+            json.dump(payload, f, indent=2, ensure_ascii=False, allow_nan=False)
         payloads.append(payload)
 
     # 释放显存, 防止碎片化 (尤其当 B*N 大时)
