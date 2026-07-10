@@ -101,8 +101,14 @@ def build_dataset_for_eval(args_config: dict):
             print(f"[warn] {dataset_root} 不存在, 跳过 {weather}")
             continue
 
-        # 遍历子目录作为 subdataset
-        subdirs = sorted([p for p in dataset_root.iterdir() if p.is_dir()])
+        # 遍历子目录作为 subdataset, 但按 splits 过滤
+        #   - 目录名是 split 名 (如 "test" / "train" / "test_a"): 只保留在 splits 列表里的
+        #   - 目录名不在 splits 里 (如 "sub_a" / "testset_v1"): 不当 split, 由下面的"情况 1/2/3"尝试匹配
+        splits = args_config.get("splits", ["test"])
+        subdirs_all = sorted([p for p in dataset_root.iterdir() if p.is_dir()])
+        subdirs_split = [p for p in subdirs_all if p.name in splits]
+        # 如果有按 split 命名的子目录, 用它; 否则保留所有(继续由情况 1/2/3 匹配)
+        subdirs = subdirs_split if subdirs_split else subdirs_all
         if not subdirs:
             print(f"[warn] {dataset_root} 下没有子目录, 跳过 {weather}")
             continue
