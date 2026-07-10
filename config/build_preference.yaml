@@ -12,27 +12,34 @@ controlnet_model_name_or_path: "./experiment/ControlNetSR/checkpoint-50000/contr
 #                并按 weather 分别处理. 二选一, filtered_json 优先.
 filtered_json: "D:/Projects/pycharm/controlnet_file/experiment/filtered/top7000_per_weather.json"
 # dataset_root: "D:/Projects/pycharm/WeaFU-main/dataprocess"
+
+# 候选保存路径 (绝对路径, 不依赖 dataset_root)
+candidates_subdir: "D:/Projects/pycharm/controlnet_file/experiment/candidates"
+
 weather_types: ["rain", "snow", "haze"]
 splits: ["train"]
-snow_num: 0
-rain_num: 0
-haze_num: 0
+snow_num: 2
+rain_num: 2
+haze_num: 2
 
 # 采样配置
-num_candidates: 16               # 每条 (LQ) 采样多少张候选
-sample_batch_size: 4             # 每个 pipeline 调用同时采样的候选数 (越大越快, 显存够可调到 8~16)
+num_candidates: 4               # 每条 (LQ) 采样多少张候选 (N)
+data_batch_size: 2              # 一次 pipeline 处理的样本数 (B), 默认 16
 inference_steps: 20
 guidance_scale: 1.0              # 构建偏好对时不使用 CFG, 避免 prompt 干扰
 height: 512
 width: 512
 seed_base: 0                     # candidate[i] 用 seed_base + i
 mixed_precision: "fp16"
+# 是否启用 xformers 内存优化注意力 (默认 false; 启用前先 pip install xformers)
+enable_xformers: false
+# 日志间隔 (秒)
+log_interval_sec: 30
 
 # 输出
-# 候选保存路径
+# 候选保存路径 (在上面已设为绝对路径)
 #   - 相对路径: 拼到 dataset_root/{weather}/{split}/candidates/{stem}/ 下 (旧行为)
 #   - 绝对路径: 直接用该路径, 再追加 {weather}/{split}/{stem}/
-candidates_subdir: "D:/Projects/pycharm/controlnet_file/experiment/candidates"
 
 # 评分配置 (4 维 reward, 全量写入 score.json)
 reward_metrics:
