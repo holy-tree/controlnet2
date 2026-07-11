@@ -20,6 +20,7 @@ ControlNet-DPO 偏好对 Dataset
 """
 
 import json
+import math
 import random
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -253,7 +254,11 @@ class DPOPreferenceDataset(data.Dataset):
             for c in cands_meta:
                 s = 0.0
                 for k, w in self.reward_weights.items():
-                    s += w * c.get(k, 0.0)
+                    v = c.get(k, 0.0)
+                    # 兜底: score.json 出现 None/NaN/Inf 时按 0 处理
+                    if v is None or not math.isfinite(v):
+                        v = 0.0
+                    s += w * v
                 scores.append(s)
         scores_t = torch.tensor(scores)
 
@@ -363,12 +368,30 @@ class DPOPreferenceDataset(data.Dataset):
                 return item
             except _WeakPreferenceError:
                 index = (index + 1) % len(self.samples)
-        # 实在找不到, 直接返回第一项 (不抛异常以避免 DataLoader 死锁)
-        return self._get(0, force=True)
+        # max_skip 用尽仍失败, 在整个 dataset 扫一遍找任何可用样本 (force=True 模式)
+        for offset in range(len(self.samples)):
+            idx = (index + offset) % len(self.samples)
+            try:
+                return self._get(idx, force=True)
+            except _WeakPreferenceError:
+                continue
+        # 实在找不到 (整个 dataset 都有问题), 抛错
+        raise RuntimeError(
+            "DPOPreferenceDataset: 没有任何 score.json 含 ≥2 个有效候选, "
+            "请先运行 scripts/build_preference.py 生成偏好数据"
+        )
 
     def _get(self, index, force=False):
         sample = self.samples[index]
         cands_meta, scores_t, top_pool, bot_pool = self._load_candidates(sample)
+
+        # 防御: score.json "candidates" 为空 (例如 build_preference 把所有 NaN 候选过滤掉了)
+        # → 至少要 2 张候选才能组成 winner/loser 对
+        if len(cands_meta) < 2:
+            raise _WeakPreferenceError(
+                f"score.json 候选数 {len(cands_meta)} < 2, 跳过"
+            )
+
         rng = random.Random(random.randint(0, 2**31 - 1))
         pair = self._sample_pair(cands_meta, scores_t, top_pool, bot_pool, rng)
         if pair is None and not force:
