@@ -231,10 +231,23 @@ def fid(pred_list, gt_list) -> float:
     mu2, sigma2 = gt_feats.mean(axis=0), np.cov(gt_feats, rowvar=False)
 
     diff = mu1 - mu2
-    covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    # scipy >= 1.13 移除了 sqrtm 的 disp 参数, 用 try 兼容新旧版本
+    try:
+        covmean, _ = linalg.sqrtm(sigma1.dot(sigma2), disp=False)
+    except TypeError:
+        # 新版 scipy 没有 disp, 用 suppress_warnings 抑制复数警告
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            covmean = linalg.sqrtm(sigma1.dot(sigma2))
     if not np.isfinite(covmean).all():
         offset = np.eye(sigma1.shape[0]) * 1e-6
-        covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
+        try:
+            covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset), disp=False)
+        except TypeError:
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                covmean = linalg.sqrtm((sigma1 + offset).dot(sigma2 + offset))
     if np.iscomplexobj(covmean):
         covmean = covmean.real
 

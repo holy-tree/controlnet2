@@ -237,13 +237,25 @@ def evaluate(args_config: dict):
 
     # ===== 评估采样数: 控制用于计算指标 (PSNR/SSIM/LPIPS) 的样本数 (per subdataset) =====
     # 默认使用全部 test 集 (保证指标统计准确)
+    # 截断模式由 sample_mode 控制:
+    #   "head"     - 取前 N 张 (固定, 可复现)
+    #   "random"   - 随机抽取 N 张 (默认, 与旧行为兼容, 但不可复现)
     default_max = args_config.get("max_samples_per_weather", 0)
+    sample_mode = args_config.get("sample_mode", "head")  # 改默认到 head (可复现)
+    if sample_mode == "random":
+        sample_seed = args_config.get("seed")
+        if sample_seed is not None:
+            random.seed(sample_seed)   # 让随机模式也可复现
     for sub_name in by_sub:
         n = len(by_sub[sub_name])
         if default_max and default_max > 0 and n > default_max:
-            random.shuffle(by_sub[sub_name])
+            if sample_mode == "random":
+                random.shuffle(by_sub[sub_name])
+            else:
+                # "head" 模式: 取前 N 张, 可复现
+                pass
             by_sub[sub_name] = by_sub[sub_name][:default_max]
-            print(f"[eval] {sub_name}: 评估采样截断为 {default_max} (用于指标计算)")
+            print(f"[eval] {sub_name}: 评估采样截断为 {default_max} ({sample_mode} 模式)")
         else:
             print(f"[eval] {sub_name}: 评估使用全部 {n} 样本")
 
