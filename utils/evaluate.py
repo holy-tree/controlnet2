@@ -29,11 +29,13 @@ import random
 import sys
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
 import torch
+import torch.nn.functional as F
 import yaml
 from PIL import Image
 from torchvision import transforms
@@ -319,8 +321,66 @@ def evaluate(args_config: dict):
     pbar = tqdm(total=total_samples, desc="Eval")
 
     lpips_net = args_config.get("lpips_net", "alex")
+    eval_batch_size = max(1, int(args_config.get("eval_batch_size", 4)))
 
-    # 按 weather 顺序遍历 subdataset
+    # 预加载 LPIPS 模型 (所有 batch 复用同一个, 避免重复下载/加载)
+    _LPIPS_MODEL = None
+    try:
+        from ramseesr.utils.metrics import _get_lpips_model as _load_lpips  # type: ignore
+        # _get_lpips_model 只接 (net, device), 不接 dtype
+        _LPIPS_MODEL = _load_lpips(lpips_net, device=device)
+    except Exception as e:
+        print(f"[warn] LPIPS 模型加载失败 ({e}), 跳过 LPIPS 指标")
+        _LPIPS_MODEL = None
+
+
+# ============================================================
+# batch 版本的 PSNR / SSIM / LPIPS (per-sample, GPU 一次算完)
+# ============================================================
+def _psnr_batch(pred: torch.Tensor, target: torch.Tensor, max_val: float = 1.0) -> List[float]:
+    """pred, target: [N, 3, H, W] in [0, 1] -> list[float], 长度 N."""
+    mse = ((pred - target) ** 2).mean(dim=[1, 2, 3])
+    mse_safe = mse.clamp(min=1e-12)
+    psnr = 20.0 * torch.log10(torch.tensor(max_val)) - 10.0 * torch.log10(mse_safe)
+    psnr = torch.where(mse <= 1e-12, torch.full_like(psnr, 100.0), psnr)
+    return psnr.tolist()
+
+
+def _ssim_batch(pred: torch.Tensor, target: torch.Tensor, window_size: int = 11) -> List[float]:
+    """pred, target: [N, 3, H, W] in [0, 1] -> list[float], 长度 N."""
+    N, C, H, W = pred.shape
+    device, dtype = pred.device, pred.dtype
+    coords = torch.arange(window_size, device=device, dtype=dtype) - window_size // 2
+    g = torch.exp(-(coords ** 2) / (2 * 1.5 ** 2))
+    g = g / g.sum()
+    window_2d = (g.unsqueeze(1) @ g.unsqueeze(0)).unsqueeze(0).unsqueeze(0)
+    window = window_2d.expand(C, 1, -1, -1).contiguous()
+    pad = window_size // 2
+    mu1 = F.conv2d(pred, window, padding=pad, groups=C)
+    mu2 = F.conv2d(target, window, padding=pad, groups=C)
+    mu1_sq, mu2_sq, mu1_mu2 = mu1 ** 2, mu2 ** 2, mu1 * mu2
+    sigma1_sq = F.conv2d(pred * pred, window, padding=pad, groups=C) - mu1_sq
+    sigma2_sq = F.conv2d(target * target, window, padding=pad, groups=C) - mu2_sq
+    sigma12 = F.conv2d(pred * target, window, padding=pad, groups=C) - mu1_mu2
+    C1, C2 = 0.01 ** 2, 0.03 ** 2
+    ssim_map = ((2 * mu1_mu2 + C1) * (2 * sigma12 + C2)) / \
+               ((mu1_sq + mu2_sq + C1) * (sigma1_sq + sigma2_sq + C2))
+    return ssim_map.mean(dim=[1, 2, 3]).tolist()
+
+
+def _lpips_batch(lpips_model, pred_batch: torch.Tensor, target_batch: torch.Tensor,
+                device, dtype) -> List[float]:
+    """pred_batch, target_batch: [N, 3, H, W] in [0, 1].  LPIPS 输入 [-1, 1]."""
+    if lpips_model is None:
+        return [float("nan")] * len(pred_batch)
+    cand_norm = (pred_batch * 2 - 1).to(device, dtype)
+    target_norm = (target_batch * 2 - 1).to(device, dtype)
+    with torch.no_grad():
+        d = lpips_model(cand_norm, target_norm)
+    d_list = d.flatten().cpu().tolist() if d.ndim > 1 else [float(d.item())] * len(pred_batch)
+    return [float(s) for s in d_list]  # 转 float 防 numpy scalar
+
+    # 按 weather 顺序遍历 subdataset, 改为 sample-level batch 处理
     for weather in args_config["weather_types"]:
         if weather not in by_weather:
             print(f"[eval] 跳过 {weather}: 没有样本")
@@ -334,62 +394,106 @@ def evaluate(args_config: dict):
             sub_dir.mkdir(parents=True, exist_ok=True)
             n_to_save = save_counts.get(sub_name, 0)
 
-            for sample_idx, (gt_path, lq_path) in enumerate(by_sub[sub_name]):
-                # 加载图像
-                gt_img = preprocess(Image.open(gt_path).convert("RGB"))
-                lq_img = preprocess(Image.open(lq_path).convert("RGB"))
+            samples = by_sub[sub_name]
+            n_sub = len(samples)
+            prompt = maybe_make_prompt(weather, args_config)
 
-                # 准备 prompt
-                prompt = maybe_make_prompt(weather, args_config)
+            # batch 处理: 一次 eval_batch_size 张 LQ 进 pipeline
+            for batch_start in range(0, n_sub, eval_batch_size):
+                batch_items = samples[batch_start:batch_start + eval_batch_size]
+                B = len(batch_items)
 
-                # LQ -> diffusion -> pred
-                lq_pil = transforms.ToPILImage()(lq_img)
+                # ===== 1. CPU 并行加载 B 张 LQ + GT =====
+                def _load_one(gt_lq_pair):
+                    gt_p, lq_p = gt_lq_pair
+                    gt_img = preprocess(Image.open(gt_p).convert("RGB"))
+                    lq_img = preprocess(Image.open(lq_p).convert("RGB"))
+                    lq_pil = transforms.ToPILImage()(lq_img)
+                    return gt_img, lq_img, lq_pil
+
+                load_workers = min(8, max(1, B))
+                with ThreadPoolExecutor(max_workers=load_workers) as ex:
+                    loaded = list(ex.map(_load_one, batch_items))
+                gt_imgs = [x[0] for x in loaded]      # [3, H, W] on CPU
+                lq_imgs = [x[1] for x in loaded]
+                lq_pils = [x[2] for x in loaded]
+                stems = [Path(gt_lq[0]).stem for gt_lq in batch_items]
+                gt_paths = [gt_lq[0] for gt_lq in batch_items]
+
+                # ===== 2. 一次性 stack 成 GPU tensor batch =====
+                gt_batch_cpu = torch.stack(gt_imgs, dim=0)                    # [B, 3, H, W] CPU
+                gt_batch = gt_batch_cpu.to(device)                              # [B, 3, H, W] GPU
+                lq_batch = torch.stack(lq_imgs, dim=0).to(device)               # [B, 3, H, W] GPU
+
+                # ===== 3. Pipeline 一次推 B 张 LQ =====
+                prompts = [prompt] * B
                 t0 = time.time()
-                with torch.autocast("cuda", enabled=(device.type == "cuda")):
-                    pred_pil = pipeline(
-                        prompt,
-                        lq_pil,
+                with torch.autocast("cuda", enabled=(device.type == "cuda")), torch.no_grad():
+                    outs = pipeline(
+                        prompt=prompts,
+                        image=lq_batch,                  # [B, 3, H, W] tensor batch
                         num_inference_steps=args_config["num_inference_steps"],
                         guidance_scale=args_config["guidance_scale"],
                         negative_prompt=args_config["negative_prompt"],
                         height=args_config["resolution"],
                         width=args_config["resolution"],
-                    ).images[0]
-                infer_time = time.time() - t0
+                        num_images_per_prompt=1,         # 关键: 每 prompt 1 张, 产出 B 张
+                    ).images                            # list[B] of PIL
+                infer_time_total = time.time() - t0
+                infer_time_avg = infer_time_total / B    # 平均每张
 
-                # pred -> tensor
-                pred_tensor = transforms.ToTensor()(pred_pil).to(device).clamp(0, 1)
-                gt_tensor = gt_img.to(device)
+                # ===== 4. 全部 preds 转 GPU tensor, batch 算指标 =====
+                pred_tensors = []
+                for i, out_pil in enumerate(outs):
+                    t = transforms.ToTensor()(out_pil).to(device).clamp(0, 1)
+                    pred_tensors.append(t)
+                pred_batch = torch.stack(pred_tensors, dim=0)                # [B, 3, H, W] GPU
 
-                # 计算指标 (每张都算)
-                p = calc_psnr(pred_tensor, gt_tensor)
-                s = calc_ssim(pred_tensor, gt_tensor)
+                # batched 算 reward
+                psnrs = _psnr_batch(pred_batch, gt_batch)
+                ssims = _ssim_batch(pred_batch, gt_batch)
                 try:
-                    l = lpips(pred_tensor, gt_tensor, net=lpips_net)
+                    lpipses = _lpips_batch(_LPIPS_MODEL, pred_batch, gt_batch, device, weight_dtype)
                 except Exception as e:
-                    print(f"[warn] LPIPS 计算失败 ({Path(gt_path).name}): {e}")
-                    l = float("nan")
+                    print(f"[warn] LPIPS batch 失败: {e}")
+                    lpipses = [float("nan")] * B
 
-                stem = Path(gt_path).stem
-                per_image_results[sub_name].append((stem, p, s, l, infer_time))
+                # ===== 5. 写指标 / 收集 FID / 保存 PNG =====
+                for i in range(B):
+                    sample_idx_global = batch_start + i
+                    p, s, l = psnrs[i], ssims[i], lpipses[i]
+                    per_image_results[sub_name].append(
+                        (stems[i], p, s, l, infer_time_avg)
+                    )
 
-                # 收集用于 FID 计算的张量 (CPU 张量, 避免长时间占 GPU 显存)
-                if enable_fid:
-                    pred_cpu = pred_tensor.detach().cpu()
-                    gt_cpu = gt_tensor.detach().cpu()
-                    fid_preds_sub[sub_name].append(pred_cpu)
-                    fid_gts_sub[sub_name].append(gt_cpu)
-                    fid_preds_weather[weather].append(pred_cpu)
-                    fid_gts_weather[weather].append(gt_cpu)
+                    if enable_fid:
+                        pred_cpu = pred_tensors[i].detach().cpu()
+                        gt_cpu = gt_imgs[i].detach().cpu()
+                        fid_preds_sub[sub_name].append(pred_cpu)
+                        fid_gts_sub[sub_name].append(gt_cpu)
+                        fid_preds_weather[weather].append(pred_cpu)
+                        fid_gts_weather[weather].append(gt_cpu)
 
-                # 保存图片 (受 save_counts 控制, 与评估数解耦)
-                if sample_idx < n_to_save:
-                    pred_pil.save(sub_dir / f"{sample_idx:03d}_{stem}_pred.png")
-                    lq_pil.save(sub_dir / f"{sample_idx:03d}_{stem}_lq.png")
-                    transforms.ToPILImage()(gt_img).save(sub_dir / f"{sample_idx:03d}_{stem}_gt.png")
+                    # 保存图片 (受 n_to_save 控制)
+                    if sample_idx_global < n_to_save:
+                        pred_tensors[i].cpu()
+                        outs[i].save(sub_dir / f"{sample_idx_global:03d}_{stems[i]}_pred.png")
+                        lq_pils[i].save(sub_dir / f"{sample_idx_global:03d}_{stems[i]}_lq.png")
+                        transforms.ToPILImage()(gt_imgs[i]).save(
+                            sub_dir / f"{sample_idx_global:03d}_{stems[i]}_gt.png"
+                        )
 
-                pbar.set_postfix(sub=sub_name, psnr=f"{p:.2f}", ssim=f"{s:.4f}", lpips=f"{l:.4f}")
-                pbar.update(1)
+                pbar.set_postfix(
+                    sub=sub_name,
+                    psnr=f"{psnrs[0]:.2f}",
+                    ssim=f"{ssims[0]:.4f}",
+                    lpips=f"{lpipses[0]:.4f}",
+                )
+                pbar.update(B)
+                # GPU 显存回收, 防止碎片化
+                del pred_batch, gt_batch, lq_batch
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     pbar.close()
 
