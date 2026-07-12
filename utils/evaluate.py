@@ -431,12 +431,15 @@ def evaluate(args_config: dict):
                 prompts = [prompt] * B
                 t0 = time.time()
                 with torch.autocast("cuda", enabled=(device.type == "cuda")), torch.no_grad():
+                    # diffusers 要求 negative_prompt 与 prompt 类型一致, batch 时都为 list
+                    neg_prompt = args_config["negative_prompt"]
+                    neg_prompts = [neg_prompt] * B if isinstance(neg_prompt, str) else neg_prompt
                     outs = pipeline(
                         prompt=prompts,
                         image=lq_batch,                  # [B, 3, H, W] tensor batch
                         num_inference_steps=args_config["num_inference_steps"],
                         guidance_scale=args_config["guidance_scale"],
-                        negative_prompt=args_config["negative_prompt"],
+                        negative_prompt=neg_prompts,
                         height=args_config["resolution"],
                         width=args_config["resolution"],
                         num_images_per_prompt=1,         # 关键: 每 prompt 1 张, 产出 B 张
