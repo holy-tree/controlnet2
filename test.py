@@ -265,6 +265,7 @@ def run_full_matrix(args):
 
     for ckpt, label, dtype_str in runs:
         args_x = _ap.Namespace(**vars(args))
+        args_x.config = None                # 关键: 阻止 main 再次加载 yaml 触发递归
         args_x.run_full_matrix = False
         args_x.compare_two_models = False
         args_x.compare_dtypes = False
@@ -379,7 +380,10 @@ def run_two_model_comparison(args):
 
     # ===== 跑 A =====
     args_a = _ap.Namespace(**vars(args))
+    args_a.config = None                   # 关键: 阻止 main 再次加载 yaml
     args_a.compare_two_models = False
+    args_a.compare_dtypes = False
+    args_a.run_full_matrix = False
     args_a.controlnet_model_path = args.controlnet_model_path
     args_a.output_dir = str(out_a)
     print("\n>>> 跑 A 模型")
@@ -387,7 +391,10 @@ def run_two_model_comparison(args):
 
     # ===== 跑 B =====
     args_b = _ap.Namespace(**vars(args))
+    args_b.config = None                   # 关键: 阻止 main 再次加载 yaml
     args_b.compare_two_models = False
+    args_b.compare_dtypes = False
+    args_b.run_full_matrix = False
     args_b.controlnet_model_path = args.controlnet_model_path_b
     args_b.output_dir = str(out_b)
     print("\n>>> 跑 B 模型")
