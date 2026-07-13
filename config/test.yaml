@@ -1,23 +1,64 @@
-controlnet_model_path: "/home/notebook/code/personal/S9048624/sr/SeeSR/preset/ckp"
-ram_ft_path: "/home/notebook/code/personal/S9048624/sr/SeeSR/preset/DAPE.pth"
-pretrained_model_path: "/home/notebook/code/personal/S9048624/sr/stable-diffusion-2-base"
-prompt: ""
-added_prompt: "clean, high-resolution, 8k"
-negative_prompt: "dotted, noise, blur, lowres, smooth"
-image_path: "/home/notebook/code/personal/S9048624/sr/ossr_version_0425/benchmark/RealLR200/LR"
-output_dir: "/home/notebook/code/personal/S9048624/sr/ossr_version_0425/benchmark/RealLR200/SeeSR5.5cfg2"
+# =====================================================================
+# ControlNet-SR 推理配置
+# =====================================================================
+# 用法:
+#   python test.py --config config/test.yaml
+#   python test.py --image_path path/to/img.png --controlnet_model_path ... --output_dir ...
+#
+# 关键开关:
+#   mixed_precision:    "fp32" (慢但精确) / "fp16" (快) / "bf16" / "no" (=fp32)
+#   compare_dtypes:     启用后, 每张图同时跑 fp32 和 fp16, 输出到 fp32/ 和 fp16/ 目录
+#                       (用于排查精度导致的色彩偏差)
+#   print_model_info:   打印各模块 dtype / training 标志 / gradient_checkpointing
+#                       (用于排查 train 模式残留 / gradient_checkpointing 残留)
+#   print_color_stats:  打印每张 pred/lq 的色彩统计 (mean / per-channel / V_HSV)
+#                       (用于排查色彩偏暗问题)
+# =====================================================================
+
+# --- 模型路径 ---
+controlnet_model_path: "D:/Projects/pycharm/controlnet_file/experiment/ControlNetSR/checkpoint-50000/controlnet"
+pretrained_model_path: "sd-research/stable-diffusion-2-base"
+
+# --- 输入 (单张 / 目录 / glob 都支持) ---
+image_path: "D:/Projects/pycharm/controlnet_file/experiment/test_imgs"
+output_dir: "D:/Projects/pycharm/controlnet_file/experiment/test_results"
+
+# --- 推理参数 ---
 mixed_precision: "fp16"
 guidance_scale: 5.5
-conditioning_scale: 1.0
-blending_alpha: 1.0
 num_inference_steps: 20
 process_size: 512
+upscale: 4
+seed: 42
+sample_times: 1
+
+# --- 色彩校正 (推理后对 pred 做颜色校正) ---
+align_method: "nofix"   # wavelet / adain / nofix
+
+# --- Prompt (DPO 阶段都为空, 因为 null_text_ratio=0) ---
+prompt: ""
+added_prompt: ""
+negative_prompt: ""
+
+# --- 加速 ---
+enable_xformers: true
+
+# --- 诊断开关 (排查色彩偏差 / 精度问题时启用) ---
+print_model_info: true
+print_color_stats: true
+compare_dtypes: false           # fp32 vs fp16 对比 (同一模型)
+compare_two_models: false       # 跨模型对比 (例如 SFT vs DPO)
+run_full_matrix: false          # 一键跑完整矩阵 (2 模型 × 2 精度 = 4 次)
+# controlnet_model_path_b: "/path/to/second/controlnet"  # 必填: run_full_matrix / compare_two_models
+# model_a_label: "SFT"           # 输出目录前缀 (默认 "A")
+# model_b_label: "DPO"           # 输出目录前缀 (默认 "B")
+
+# --- 保留旧选项 (兼容) ---
+conditioning_scale: 1.0
+blending_alpha: 1.0
 vae_decoder_tiled_size: 2048
 vae_encoder_tiled_size: 2048
 latent_tiled_size: 96
 latent_tiled_overlap: 32
-upscale: 4
-seed: null
-sample_times: 1
-align_method: "adain"
 save_prompts: false
+ram_ft_path: null
