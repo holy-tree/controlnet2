@@ -98,6 +98,12 @@ def load_pipeline(args, device, dtype):
         m.requires_grad_(False)
         m.eval()
 
+    # ===== 关键: 把所有模块 cast 到目标 dtype =====
+    # 否则 StableDiffusionControlNetPipeline.from_pretrained 的 torch_dtype 参数
+    # 会被忽略 (因为 vae/unet/controlnet 已经被预加载了), 导致 fp32 / fp16 实际等价
+    for m in (vae, text_encoder, unet, controlnet):
+        m.to(dtype=dtype)
+
     # ===== 显式关闭 gradient_checkpointing (推理加速) =====
     if hasattr(controlnet, "disable_gradient_checkpointing"):
         controlnet.disable_gradient_checkpointing()
@@ -189,20 +195,26 @@ def run_single_inference(
     autocast_dtype: Optional[torch.dtype],
 ):
     """
-    一次推理, 支持指定 autocast dtype (fp32 时即关闭混合精度).
+    一次推理, 支持指定 autocast dtype.
 
     autocast_dtype:
-        torch.float32 → 用 no-op context (完全 fp32)
-        torch.float16 → autocast to fp16 (测 fp16 色彩影响)
-        None         → 不包 autocast (用 pipeline 的 dtype)
+        torch.float32 → torch.no_grad() (完全 fp32, 不应用 autocast)
+        torch.float16 → autocast(fp16) (测 fp16 色彩影响)
+        torch.bfloat16 → autocast(bf16)
+        None         → torch.no_grad() (用 pipeline 自身的 dtype, 不叠加 autocast)
+
+    关键: 默认 None 是 no_grad 而不是 autocast("cuda").
+    原因: torch.autocast("cuda") 默认 fp16, 会把 fp32 pipeline 的 op 也降精度,
+          导致 fp32 / fp16 run 输出无法区分.
     """
-    if autocast_dtype == torch.float32:
-        # 强制 fp32: 用 no_grad + 不开 autocast
+    if autocast_dtype is None:
         ctx = torch.no_grad()
-    elif autocast_dtype is not None:
+    elif autocast_dtype == torch.float32:
+        ctx = torch.no_grad()
+    elif autocast_dtype in (torch.float16, torch.bfloat16):
         ctx = torch.autocast("cuda", dtype=autocast_dtype)
     else:
-        ctx = torch.autocast("cuda")
+        ctx = torch.no_grad()
 
     with ctx:
         out = pipeline(
@@ -284,7 +296,8 @@ def run_full_matrix(args):
     matrix_stats: dict = {}
     for _, label, dtype_str in runs:
         d = out_root / f"{label}_{dtype_str}"
-        files = sorted(p for p in d.iterdir()
+        # 递归查找 PNG (处理 sample00/ 子目录的情况)
+        files = sorted(p for p in d.rglob("*")
                        if p.suffix.lower() in img_exts and p.is_file())
         stats_list = []
         for p in files:
@@ -405,8 +418,11 @@ def run_two_model_comparison(args):
     print("[色彩对比结果] (A - B = 差值, 正值 = A 比 B 更亮)")
     print("=" * 70)
     img_exts = {".png", ".jpg", ".jpeg"}
-    files_a = sorted(p for p in out_a.iterdir() if p.suffix.lower() in img_exts and p.is_file())
-    files_b = sorted(p for p in out_b.iterdir() if p.suffix.lower() in img_exts and p.is_file())
+    # 递归查找 PNG (处理 sample00/ 子目录)
+    files_a = sorted(p for p in out_a.rglob("*")
+                     if p.suffix.lower() in img_exts and p.is_file())
+    files_b = sorted(p for p in out_b.rglob("*")
+                     if p.suffix.lower() in img_exts and p.is_file())
     names_b = {p.name: p for p in files_b}
 
     diff_means = []
