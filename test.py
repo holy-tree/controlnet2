@@ -435,11 +435,26 @@ def main(args):
     if args.config is not None:
         with open(args.config, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f)
+        # yaml 始终覆盖 argparse 默认值.
+        # 注意: argparse 中 action="store_true" 的默认是 False (不是 None),
+        #       原 is None 判断会让 boolean flag 永远不能被 yaml 覆盖.
+        #       (例如 run_full_matrix: true 在 yaml 里会被忽略)
         for key, value in config.items():
-            if hasattr(args, key) and getattr(args, key) is None:
+            if hasattr(args, key):
                 setattr(args, key, value)
-            elif not hasattr(args, key):
+            else:
                 setattr(args, key, value)
+        # 打印关键诊断开关的最终值, 便于排查
+        if args.print_model_info:
+            print("=" * 60)
+            print("[YAML Config 加载结果]")
+            for k in ("run_full_matrix", "compare_two_models", "compare_dtypes",
+                     "print_color_stats", "print_model_info", "mixed_precision",
+                     "controlnet_model_path", "controlnet_model_path_b",
+                     "model_a_label", "model_b_label"):
+                if hasattr(args, k):
+                    print(f"  {k} = {getattr(args, k)!r}")
+            print("=" * 60)
 
     # ===== 双模型对比模式 (放在最前, 内部递归调用 main) =====
     if args.run_full_matrix:
