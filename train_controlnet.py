@@ -50,6 +50,8 @@ from diffusers import (
     UNet2DConditionModel,
     UniPCMultistepScheduler,
 )
+
+from models.c2d_controlnet import C2DControlNet
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
@@ -688,6 +690,16 @@ def parse_args(input_args=None):
                         default="dotted, noise, blur, lowres, smooth",
                         help="验证时的 negative prompt")
 
+    # 新增: C2F-MAFC 增强条件编码器参数
+    parser.add_argument("--c2d_dw_expand", type=int, default=1,
+                        help="C2FBlock 内部 DW_Expand (Stage 1 固定 1)")
+    parser.add_argument("--c2d_ffn_expand", type=int, default=2,
+                        help="C2FBlock 内部 FFN_Expand")
+    parser.add_argument("--c2d_dropout", type=float, default=0.0,
+                        help="C2FBlock 内部 dropout 概率")
+    parser.add_argument("--c2d_reduction", type=int, default=8,
+                        help="C2FBlock 内部 ChannelAttention 通道压缩倍率")
+
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
@@ -974,11 +986,17 @@ def main(args):
     )
 
     if args.controlnet_model_name_or_path:
-        logger.info("Loading existing controlnet weights")
-        controlnet = ControlNetModel.from_pretrained(args.controlnet_model_name_or_path)
+        logger.info("Loading existing C2D controlnet weights")
+        controlnet = C2DControlNet.from_pretrained(args.controlnet_model_name_or_path)
     else:
-        logger.info("Initializing controlnet weights from unet")
-        controlnet = ControlNetModel.from_unet(unet)
+        logger.info("Initializing C2D controlnet weights from unet (hierarchical init)")
+        controlnet = C2DControlNet.from_unet_c2d(
+            unet,
+            c2d_dw_expand=args.c2d_dw_expand,
+            c2d_ffn_expand=args.c2d_ffn_expand,
+            c2d_dropout=args.c2d_dropout,
+            c2d_reduction=args.c2d_reduction,
+        )
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -1002,7 +1020,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = ControlNetModel.from_pretrained(input_dir, subfolder="controlnet")
+                load_model = C2DControlNet.from_pretrained(input_dir, subfolder="controlnet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -1102,7 +1120,7 @@ def main(args):
         if args.sft_controlnet_ckpt:
             logger.info(f"[DPO] 加载 SFT controlnet 权重 from {args.sft_controlnet_ckpt}")
             # 从原版 unet 初始化结构 (与 main 顶部的 controlnet 一致), 然后 load_state_dict
-            sft_cn = ControlNetModel.from_pretrained(args.sft_controlnet_ckpt)
+            sft_cn = C2DControlNet.from_pretrained(args.sft_controlnet_ckpt)
             controlnet.load_state_dict(sft_cn.state_dict())
             del sft_cn
         else:
