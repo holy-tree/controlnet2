@@ -1,0 +1,27 @@
+# ControlNetSR 控制残差三项快速排查 默认配置
+# 用法: python pre_test/diagnose_control_residual.py --config config/diagnose_control_residual.yaml
+
+pretrained_model_name_or_path: "sd-research/stable-diffusion-2-base"
+controlnet_model_path: "./experiment/ControlNetSR/checkpoint-50000"
+lq_image_path: "experiment/eval/20260704_173616_eval/rain/000_rain-1701_lq.png"
+gt_image_path: "experiment/eval/20260704_173616_eval/rain/000_rain-1701_gt.png"
+output_dir: "./pre_test/output"
+
+# all / weights_only / residuals_only / ablation
+mode: "all"
+
+prompt: ""
+negative_prompt: "dotted, noise, blur, lowres, smooth"
+resolution: 512
+num_inference_steps: 20
+guidance_scale: 5.5
+mixed_precision: "fp16"
+enable_xformers_memory_efficient_attention: false
+seed: 42
+lpips_net: "alex"
+
+# 判读阈值 (仅供 summary 给出建议, 不会终止流程)
+weight_norm_min_healthy: 1.0e-4
+residual_abs_mean_min_healthy: 1.0e-3
+residual_abs_mean_max_healthy: 1.0
+ablation_psnr_drop_db: 0.1
