@@ -102,6 +102,35 @@ def image_grid(imgs, rows, cols):
     return grid
 
 
+def _log_arca_monitor(controlnet, accelerator, global_step):
+    """
+    ARCA 分层 alpha + 残差 std 监控 (论文 method 章节消融图表数据源).
+
+    表格列:
+        name | alpha | tanh(alpha) | scale=last_residual_scale | res_std
+    备注:
+        - res_std 来自 self.main_arca[i]._last_residual_stats, 由 ARCA.forward 在 training 模式缓存
+        - 主 stage 0/1/2/3 是 4 个 main_arca, 加 down_0/1 + mid 共 7 个 stage
+        - 用 accelerator.unwrap_model 取回原模型, 兼容 DDP/Accelerate 包装
+    """
+    try:
+        from models.arca import collect_arca_monitor, format_arca_monitor
+        raw = accelerator.unwrap_model(controlnet)
+        records = collect_arca_monitor(raw)
+        if not records:
+            return
+        table = format_arca_monitor(records)
+        # logger.info 不支持多行字符串, 用分隔的 print
+        for line in table.split("\n"):
+            logger.info(f"[ARCA step {global_step:>6d}] {line}")
+        # 同时把 alpha 标量推到 tensorboard
+        for i, r in enumerate(records):
+            accelerator.log({f"arca/alpha_{i}": r["alpha"],
+                             f"arca/tanh_alpha_{i}": r["tanh_alpha"]}, step=global_step)
+    except Exception as e:
+        logger.warning(f"[ARCA] 监控打印失败: {e}")
+
+
 def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step):
     logger.info("Running validation... ")
 
@@ -411,6 +440,14 @@ def parse_args(input_args=None):
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
     parser.add_argument("--adam_epsilon", type=float, default=1e-08, help="Epsilon value for the Adam optimizer")
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
+    # ARCA 自适应残差校准模块相关 (论文 method)
+    parser.add_argument("--arca_lr", type=float, default=3e-6,
+                        help="7 个 stage_alpha 的独立学习率 (建议 2e-6 ~ 5e-6, "
+                             "远小于 --learning_rate, 防止 alpha 增长过快).")
+    parser.add_argument("--arca_alpha_weight_decay", type=float, default=0.0,
+                        help="stage_alpha 的 weight_decay (默认 0, 不应加衰减).")
+    parser.add_argument("--arca_log_interval", type=int, default=500,
+                        help="每 N 步打印一次 7 层 alpha + 残差 std 监控表.")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
     parser.add_argument(
@@ -1102,9 +1139,31 @@ def main(args):
         optimizer_class = torch.optim.AdamW
 
     # Optimizer creation
-    params_to_optimize = controlnet.parameters()
+    # ARCA-aware 分组: 7 个 stage_alpha 用单独小 lr (--arca_lr),
+    # 其余 controlnet 参数 (含 7 个 zero_conv + DWConv/PWConv/LN + 编码器) 用 --learning_rate.
+    alpha_params, other_params = [], []
+    for name, p in controlnet.named_parameters():
+        if not p.requires_grad:
+            continue
+        if name.endswith(".alpha"):
+            alpha_params.append(p)
+        else:
+            other_params.append(p)
+    if alpha_params:
+        print(f"[ARCA] 检测到 {len(alpha_params)} 个 stage_alpha 参数, "
+              f"lr={args.arca_lr}, weight_decay={args.arca_alpha_weight_decay}")
+        param_groups = [
+            {"params": other_params, "lr": args.learning_rate,
+             "weight_decay": args.adam_weight_decay},
+            {"params": alpha_params, "lr": args.arca_lr,
+             "weight_decay": args.arca_alpha_weight_decay,
+             "name": "arca_alpha"},
+        ]
+    else:
+        param_groups = [{"params": other_params, "lr": args.learning_rate,
+                        "weight_decay": args.adam_weight_decay}]
     optimizer = optimizer_class(
-        params_to_optimize,
+        param_groups,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -1505,6 +1564,14 @@ def main(args):
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             if args.train_method == "dpo":
                 logs["implicit_acc"] = float(implicit_acc.detach().item())
+
+            # ARCA 监控: 每 N 步打印 7 层 alpha + 残差 std (论文消融图表数据源)
+            if (args.arca_log_interval > 0
+                    and global_step > 0
+                    and global_step % args.arca_log_interval == 0
+                    and accelerator.is_main_process):
+                _log_arca_monitor(controlnet, accelerator, global_step)
+
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
 

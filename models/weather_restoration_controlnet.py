@@ -37,8 +37,9 @@ import torch.nn as nn
 
 from diffusers import ControlNetModel
 
+from .arca import ARCAResidualCalibrator, LightweightAdapter
 from .c2f_block import (
-    LightweightAdapter,
+    LightweightAdapter as _LegacyLightweightAdapter,
     TimedC2FBlock,
     zero_conv,
 )
@@ -86,11 +87,12 @@ class WeatherRestorationControlNet(ControlNetModel):
         # 这样 isinstance(cn, ControlNetModel) 仍为 True (通过继承),
         # 但不会浪费显存/时间去构建 down_blocks / mid_block / controlnet_down_blocks 等
         nn.Module.__init__(self)
+        self.use_arca = True
 
         # ---- 1. 退化感知编码器 ----
         self.weather_encoder = WeatherDegradationEncoder(in_channels=in_channels)
 
-        # ---- 2. 四级 Timed-C2F + Adapter ----
+        # ---- 2. 四级 Timed-C2F ----
         self.timed_c2f_blocks = nn.ModuleList([
             TimedC2FBlock(
                 c=ch, DW_Expand=c2d_dw_expand, FFN_Expand=c2d_ffn_expand,
@@ -99,26 +101,73 @@ class WeatherRestorationControlNet(ControlNetModel):
             )
             for ch in self.SD2_STAGE_CHANNELS
         ])
-        self.adapters = nn.ModuleList([
-            LightweightAdapter(ch) for ch in self.SD2_STAGE_CHANNELS
+
+        # ---- 3. ARCA: 4 主 + 2 投影 + 1 mid = 7 个独立 stage, 每个含 1 个可学习 alpha ----
+        # 4 个主 stage (与 4 个 c2f 块一一对应)
+        self.main_arca = nn.ModuleList([
+            ARCAResidualCalibrator(320, 320),     # F64
+            ARCAResidualCalibrator(640, 640),     # F32
+            ARCAResidualCalibrator(1280, 1280),   # F16
+            ARCAResidualCalibrator(1280, 1280),   # F8
         ])
-
-        # ---- 3. 7 个 ZeroConv (全部 zero-init, 训练初期整体输出为 0) ----
-        # 4 主 stage zero_conv (per scale, 应用一次后 broadcast 到多个 UNet 位置)
-        self.zero_conv_stage_0 = zero_conv(320, 320)    # F64 -> pos 0, 1, 2
-        self.zero_conv_stage_1 = zero_conv(640, 640)    # F32 -> pos 4, 5
-        self.zero_conv_stage_2 = zero_conv(1280, 1280)  # F16 -> pos 7, 8
-        self.zero_conv_stage_3 = zero_conv(1280, 1280)  # F8  -> pos 9, 10, 11
-
-        # 2 下采样位置 zero_conv (从下一 stage 投影通道, channel projection)
-        self.zero_conv_down_0 = zero_conv(640, 320)    # F32 -> 320ch (pos 3: block0_downsample)
-        self.zero_conv_down_1 = zero_conv(1280, 640)   # F16 -> 640ch (pos 6: block1_downsample)
-
-        # 1 mid zero_conv
-        self.zero_conv_mid = zero_conv(1280, 1280)     # F8 -> mid
+        # 2 个下采样投影 (从下一 stage 投影通道)
+        self.down_arca = nn.ModuleList([
+            ARCAResidualCalibrator(640, 320),     # F32 -> 320
+            ARCAResidualCalibrator(1280, 640),    # F16 -> 640
+        ])
+        # 1 个 mid
+        self.mid_arca = ARCAResidualCalibrator(1280, 1280)
 
         # 注意: 不要手动设置 self.dtype, ControlNetModel 继承自 ModelMixin,
         #       dtype 是 property, 动态从参数 dtype 取值.
+
+    # ------------------------------------------------------------------------
+    # 类级 property: 把 7 个 zero_conv 通过统一命名暴露, 兼容旧代码 / 诊断脚本.
+    #   - ARCA 模式: 指向 main_arca[i] / down_arca[i] / mid_arca 内部的 zero_conv
+    #   - 旧模式: 指向 __init__ 里直接赋的 self.zero_conv_stage_0 (Conv2d 实例)
+    #   - state_dict 不会收集 property, ARCA 模式不会有重复 key
+    # ------------------------------------------------------------------------
+    @property
+    def zero_conv_stage_0(self):  # type: ignore[override]
+        if hasattr(self, "main_arca"):
+            return self.main_arca[0].zero_conv
+        return self.__dict__["zero_conv_stage_0"]
+
+    @property
+    def zero_conv_stage_1(self):  # type: ignore[override]
+        if hasattr(self, "main_arca"):
+            return self.main_arca[1].zero_conv
+        return self.__dict__["zero_conv_stage_1"]
+
+    @property
+    def zero_conv_stage_2(self):  # type: ignore[override]
+        if hasattr(self, "main_arca"):
+            return self.main_arca[2].zero_conv
+        return self.__dict__["zero_conv_stage_2"]
+
+    @property
+    def zero_conv_stage_3(self):  # type: ignore[override]
+        if hasattr(self, "main_arca"):
+            return self.main_arca[3].zero_conv
+        return self.__dict__["zero_conv_stage_3"]
+
+    @property
+    def zero_conv_down_0(self):  # type: ignore[override]
+        if hasattr(self, "down_arca"):
+            return self.down_arca[0].zero_conv
+        return self.__dict__["zero_conv_down_0"]
+
+    @property
+    def zero_conv_down_1(self):  # type: ignore[override]
+        if hasattr(self, "down_arca"):
+            return self.down_arca[1].zero_conv
+        return self.__dict__["zero_conv_down_1"]
+
+    @property
+    def zero_conv_mid(self):  # type: ignore[override]
+        if hasattr(self, "mid_arca"):
+            return self.mid_arca.zero_conv
+        return self.__dict__["zero_conv_mid"]
 
         # ---- 4. config (供 pipeline / save_pretrained 读取) ----
         # 通过 register_to_config 注入 config (ConfigMixin 标准做法),
@@ -192,8 +241,8 @@ class WeatherRestorationControlNet(ControlNetModel):
         """新增模块初始化:
             - Encoder 内部: Kaiming normal + Norm = 1/0
             - TimedC2F 内部: Kaiming normal + β/γ = 0 + Time MLP 小权重
-            - Adapter 内部: Kaiming normal + Norm = 1/0
-            - 全部 ZeroConv: 已在 zero_conv() 中初始化为 0 (无需重复)
+            - ARCA 内部: DWConv/PWConv Kaiming + LN=1/0 + alpha=0 (训练初残差=0)
+            - 全部 ZeroConv: 已在 _zero_conv 中初始化为 0
         """
         # Encoder
         for m in self.weather_encoder.modules():
@@ -224,9 +273,10 @@ class WeatherRestorationControlNet(ControlNetModel):
             nn.init.normal_(c2f.time_mlp[-1].weight, std=0.02)
             nn.init.zeros_(c2f.time_mlp[-1].bias)
 
-        # Adapter
-        for adp in self.adapters:
-            for m in adp.modules():
+        # ARCA: 7 个 stage, 各自 Kaiming + LN=1/0 + alpha=0 + zero_conv=0
+        all_arca = list(self.main_arca) + list(self.down_arca) + [self.mid_arca]
+        for arca in all_arca:
+            for m in arca.modules():
                 if isinstance(m, (nn.Conv2d, nn.Linear)):
                     nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                     if m.bias is not None:
@@ -236,8 +286,14 @@ class WeatherRestorationControlNet(ControlNetModel):
                         nn.init.ones_(m.weight)
                     if hasattr(m, 'bias') and m.bias is not None:
                         nn.init.zeros_(m.bias)
+            # 关键: alpha 初始 0 -> tanh(0)=0 -> 训练初残差恒为 0, 不破坏 SD 预训练
+            nn.init.zeros_(arca.alpha)
+            # 防御性: zero_conv 已 0 init, 这里冗余保险
+            nn.init.zeros_(arca.zero_conv.weight)
+            if arca.zero_conv.bias is not None:
+                nn.init.zeros_(arca.zero_conv.bias)
 
-        # 防御性: 再次确认全部 ZeroConv 为 0 (zero_conv() 已保证, 这里冗余保险)
+        # 防御性: 再次确认全部 ZeroConv 为 0 (property 兼容旧命名)
         for name in ['zero_conv_stage_0', 'zero_conv_stage_1', 'zero_conv_stage_2',
                      'zero_conv_stage_3', 'zero_conv_down_0', 'zero_conv_down_1',
                      'zero_conv_mid']:
@@ -285,24 +341,17 @@ class WeatherRestorationControlNet(ControlNetModel):
         # feats[2] F16: (B, 1280, H/32, W/32)
         # feats[3] F8 : (B, 1280, H/64, W/64)
 
-        # ---- 2. 四级 TimedC2F + Adapter, 产出 4 个主残差 ----
-        main_residuals = []
-        for i in range(4):
-            x = self.timed_c2f_blocks[i](feats[i], timestep)
-            x = self.adapters[i](x)
-            main_residuals.append(x)
-
-        # ---- 3. ZeroConv: 4 主 + 2 down + 1 mid ----
-        # 4 主 stage
-        r_F64 = self.zero_conv_stage_0(main_residuals[0])   # 320ch, 64x64
-        r_F32 = self.zero_conv_stage_1(main_residuals[1])   # 640ch, 32x32
-        r_F16 = self.zero_conv_stage_2(main_residuals[2])   # 1280ch, 16x16
-        r_F8 = self.zero_conv_stage_3(main_residuals[3])    # 1280ch, 8x8
-        # 2 downsample 位置 (channel projection)
-        r_down_0 = self.zero_conv_down_0(main_residuals[1]) # 320ch, 32x32 (from F32)
-        r_down_1 = self.zero_conv_down_1(main_residuals[2]) # 640ch, 16x16 (from F16)
-        # mid
-        r_mid = self.zero_conv_mid(main_residuals[3])       # 1280ch, 8x8
+        # ---- 2. 四级 TimedC2F + ARCA, 产出 4 个主残差 (已是 zero_conv + alpha 校准后) ----
+        # 4 个主 stage 各自吃 c2f 输出, 各自有独立 zero_conv + alpha
+        r_F64 = self.main_arca[0](feats[0])   # 320ch, 64x64
+        r_F32 = self.main_arca[1](feats[1])   # 640ch, 32x32
+        r_F16 = self.main_arca[2](feats[2])   # 1280ch, 16x16
+        r_F8  = self.main_arca[3](feats[3])   # 1280ch, 8x8
+        # 2 downsample 位置 (channel projection) - 各自 ARCA, 直接吃 c2f 输出
+        r_down_0 = self.down_arca[0](feats[1])  # 320ch, 32x32 (from F32)
+        r_down_1 = self.down_arca[1](feats[2])  # 640ch, 16x16 (from F16)
+        # mid - 独立 ARCA, 直接吃 c2f 输出
+        r_mid = self.mid_arca(feats[3])         # 1280ch, 8x8
 
         # ---- 4. 拼装 12 down_res + 1 mid_res, 顺序严格匹配 SD2 UNet ----
         # [pos 0..2]: F64 × 3
