@@ -203,25 +203,40 @@ def _inception_features(images: torch.Tensor) -> torch.Tensor:
     return torch.cat(feats, dim=0)
 
 
-def fid(pred_list, gt_list) -> float:
+def fid(pred_list, gt_list, batch_size: int = 32) -> float:
     """
     计算 FID (Frechet Inception Distance).
     pred_list, gt_list: list of tensors in [0, 1] (任意尺寸均可, 内部 resize 到 299x299)
+    batch_size: 一次喂 InceptionV3 的图片数, 控制峰值显存 (默认 32)
     返回: float (越小越好, 表示两组图像分布越接近)
 
     算法:
-        1. 用 InceptionV3 提取两组图像的 2048 维特征
+        1. 用 InceptionV3 流式提取两组图像的 2048 维特征 (按 batch_size 分块, 不一次性 stack)
         2. 分别计算均值 mu 与协方差 sigma
         3. FID = ||mu1 - mu2||^2 + Tr(sigma1 + sigma2 - 2*sqrt(sigma1 @ sigma2))
+
+    注意: 旧版本会一次性 torch.stack 全部图片, 在 N>500+512x512 时峰值显存 ~12GB 易 OOM.
+          本版本只缓存 [N, 2048] 的特征 (~32MB), 峰值显存由 batch_size 控制.
     """
     if not pred_list or not gt_list:
         return float("nan")
 
-    pred_t = torch.stack([(_to_4d(p) if isinstance(p, torch.Tensor) else _to_4d(torch.as_tensor(p))).squeeze(0) for p in pred_list]).float()
-    gt_t = torch.stack([(_to_4d(g) if isinstance(g, torch.Tensor) else _to_4d(torch.as_tensor(g))).squeeze(0) for g in gt_list]).float()
+    def _stream_features(img_list, bs):
+        """按 bs 分块流式提取 InceptionV3 特征, 返回 [N, 2048] tensor."""
+        all_feats = []
+        for i in range(0, len(img_list), bs):
+            chunk = img_list[i:i + bs]
+            batch = torch.stack([
+                (_to_4d(p) if isinstance(p, torch.Tensor) else _to_4d(torch.as_tensor(p))).squeeze(0)
+                for p in chunk
+            ]).float()
+            feats = _inception_features(batch)  # [bs, 2048]
+            all_feats.append(feats.cpu())
+            del batch  # 及时释放 chunk 显存
+        return torch.cat(all_feats, dim=0).double().numpy()
 
-    pred_feats = _inception_features(pred_t).cpu().double().numpy()
-    gt_feats = _inception_features(gt_t).cpu().double().numpy()
+    pred_feats = _stream_features(pred_list, batch_size)
+    gt_feats = _stream_features(gt_list, batch_size)
 
     # 计算 FID
     import numpy as np

@@ -51,7 +51,7 @@ from diffusers import (
     UniPCMultistepScheduler,
 )
 
-from models.c2d_controlnet import C2DControlNet
+from models.weather_restoration_controlnet import WeatherRestorationControlNet
 from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
@@ -986,17 +986,17 @@ def main(args):
     )
 
     if args.controlnet_model_name_or_path:
-        logger.info("Loading existing C2D controlnet weights")
-        controlnet = C2DControlNet.from_pretrained(args.controlnet_model_name_or_path)
+        logger.info("Loading existing Weather Restoration ControlNet weights")
+        controlnet = WeatherRestorationControlNet.from_pretrained(args.controlnet_model_name_or_path)
     else:
-        logger.info("Initializing C2D controlnet weights from unet (hierarchical init)")
-        controlnet = C2DControlNet.from_unet_c2d(
-            unet,
+        logger.info("Initializing Weather Restoration ControlNet from scratch")
+        controlnet = WeatherRestorationControlNet(
             c2d_dw_expand=args.c2d_dw_expand,
             c2d_ffn_expand=args.c2d_ffn_expand,
             c2d_dropout=args.c2d_dropout,
             c2d_reduction=args.c2d_reduction,
         )
+        controlnet._init_new_modules()
 
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
@@ -1020,7 +1020,7 @@ def main(args):
                 model = models.pop()
 
                 # load diffusers style into model
-                load_model = C2DControlNet.from_pretrained(input_dir, subfolder="controlnet")
+                load_model = WeatherRestorationControlNet.from_pretrained(input_dir, subfolder="controlnet")
                 model.register_to_config(**load_model.config)
 
                 model.load_state_dict(load_model.state_dict())
@@ -1120,7 +1120,7 @@ def main(args):
         if args.sft_controlnet_ckpt:
             logger.info(f"[DPO] 加载 SFT controlnet 权重 from {args.sft_controlnet_ckpt}")
             # 从原版 unet 初始化结构 (与 main 顶部的 controlnet 一致), 然后 load_state_dict
-            sft_cn = C2DControlNet.from_pretrained(args.sft_controlnet_ckpt)
+            sft_cn = WeatherRestorationControlNet.from_pretrained(args.sft_controlnet_ckpt)
             controlnet.load_state_dict(sft_cn.state_dict())
             del sft_cn
         else:

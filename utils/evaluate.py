@@ -519,11 +519,12 @@ def evaluate(args_config: dict):
         }
 
     # ===== 计算每个 subdataset 的 FID =====
+    fid_bs = args_config.get("fid_batch_size", 32)
     if enable_fid:
         print("\n[FID] 开始计算 FID...")
         for sub_name in sub_metrics:
             try:
-                fid_val = calc_fid(fid_preds_sub[sub_name], fid_gts_sub[sub_name])
+                fid_val = calc_fid(fid_preds_sub[sub_name], fid_gts_sub[sub_name], batch_size=fid_bs)
                 sub_metrics[sub_name]["fid"] = fid_val
                 print(f"  [FID] {sub_name}: {fid_val:.4f} (N={len(fid_preds_sub[sub_name])})")
             except Exception as e:
@@ -564,7 +565,7 @@ def evaluate(args_config: dict):
         for weather in args_config["weather_types"]:
             if weather in fid_preds_weather and len(fid_preds_weather[weather]) > 0:
                 try:
-                    fid_val = calc_fid(fid_preds_weather[weather], fid_gts_weather[weather])
+                    fid_val = calc_fid(fid_preds_weather[weather], fid_gts_weather[weather], batch_size=fid_bs)
                     weather_metrics[weather]["fid"] = fid_val
                     print(f"  [FID] {weather}: {fid_val:.4f} (N={len(fid_preds_weather[weather])})")
                 except Exception as e:
@@ -580,7 +581,7 @@ def evaluate(args_config: dict):
             all_gts.extend(fid_gts_weather[w])
         if all_preds:
             try:
-                overall_fid = calc_fid(all_preds, all_gts)
+                overall_fid = calc_fid(all_preds, all_gts, batch_size=fid_bs)
                 print(f"  [FID] Overall: {overall_fid:.4f} (N={len(all_preds)})")
             except Exception as e:
                 print(f"  [FID] Overall 计算失败: {e}")
