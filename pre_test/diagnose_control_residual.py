@@ -83,6 +83,7 @@ from diffusers import (
 )
 from diffusers.utils.import_utils import is_xformers_available
 
+from models.weather_restoration_controlnet import WeatherRestorationControlNet
 from ramseesr.utils.metrics import (
     _get_lpips_model,
     lpips as calc_lpips,
@@ -200,6 +201,43 @@ def merge_config(args: argparse.Namespace) -> Dict:
     return cfg
 
 
+def _load_controlnet_smart(cn_path: str) -> torch.nn.Module:
+    """
+    根据 <dir>/config.json 的 _class_name 自动选 ControlNet 类加载.
+
+      - "ControlNetModel"             -> diffusers vanilla (读 .bin / .safetensors)
+      - "WeatherRestorationControlNet" -> 项目自定义 (只读 .bin)
+      - 其它/缺省: 走 vanilla
+    """
+    cfg_path = Path(cn_path) / "config.json"
+    class_name = "ControlNetModel"
+    if cfg_path.is_file():
+        try:
+            with io.open(cfg_path, "r", encoding="utf-8") as f:
+                class_name = json.load(f).get("_class_name", "ControlNetModel")
+        except Exception as e:
+            print(f"[load] 解析 config.json 失败: {e}, 默认走 ControlNetModel")
+
+    if class_name == "WeatherRestorationControlNet":
+        print(f"[load] 检测到自定义类 {class_name}, 用 WeatherRestorationControlNet.from_pretrained 加载")
+        # 强制先把目录切到绝对路径
+        cn_path_abs = str(Path(cn_path).resolve())
+        model = WeatherRestorationControlNet.from_pretrained(cn_path_abs)
+    else:
+        print(f"[load] 使用 vanilla ControlNetModel (class_name={class_name})")
+        model = ControlNetModel.from_pretrained(cn_path)
+
+    # 防御: from_pretrained 偶尔会留下 meta device, 强制搬回 cpu
+    try:
+        if any(p.is_meta for p in model.parameters()):
+            print("[load] 检测到 meta device, 触发 to_empty + state_dict 重载")
+            model.to_empty(device="cpu")
+    except Exception:
+        pass
+
+    return model
+
+
 # =============================================================================
 # zero_conv 收集器 (同时兼容 vanilla ControlNetModel 与 WeatherRestorationControlNet)
 # =============================================================================
@@ -253,12 +291,20 @@ def check_weight_norms(
         return {"zero_convs": [], "summary": {}}
 
     rows: List[Dict] = []
+    skipped_meta: List[str] = []
     for name, m in zero_convs:
         with torch.no_grad():
-            w_norm = m.weight.detach().float().norm().item()
-            b_norm = m.bias.detach().float().norm().item() if m.bias is not None else 0.0
+            w = m.weight.detach()
+            if w.is_meta:
+                skipped_meta.append(name)
+                continue
+            w_norm = w.float().norm().item()
+            b = m.bias.detach() if m.bias is not None else None
+            b_norm = (b.float().norm().item() if b is not None and not b.is_meta else 0.0)
         rows.append({"name": name, "weight_norm": w_norm, "bias_norm": b_norm,
                      "in_ch": m.in_channels, "out_ch": m.out_channels})
+    if skipped_meta:
+        print(f"[1/3] 警告: 以下 zero_conv 仍位于 meta device, 已跳过: {skipped_meta}")
 
     lines = ["# zero_conv 权重范数检查  (训练后若仍接近 0 -> 控制分支未训练开)",
              f"# 共 {len(rows)} 个 zero_conv   健康阈值 |W| > {cfg['weight_norm_min_healthy']:.1e}\n"]
@@ -584,7 +630,7 @@ def build_pipeline(cfg: Dict, device: torch.device, dtype: torch.dtype
                    ) -> StableDiffusionControlNetPipeline:
     cn_path = resolve_controlnet_path(cfg["controlnet_model_path"])
     print(f"[load] ControlNet 权重目录: {cn_path}")
-    controlnet = ControlNetModel.from_pretrained(cn_path)
+    controlnet = _load_controlnet_smart(cn_path)
 
     pipeline = StableDiffusionControlNetPipeline.from_pretrained(
         cfg["pretrained_model_name_or_path"],
@@ -658,7 +704,7 @@ def main() -> None:
         print("[1/3] zero_conv 权重范数检查  (无需推理, 只加载权重)")
         print("=" * 70)
         cn_path = resolve_controlnet_path(cfg["controlnet_model_path"])
-        controlnet_only = ControlNetModel.from_pretrained(cn_path)
+        controlnet_only = _load_controlnet_smart(cn_path)
         results["weight_norms"] = check_weight_norms(controlnet_only, cfg, out_dir)
         del controlnet_only
 
