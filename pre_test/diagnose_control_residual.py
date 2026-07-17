@@ -335,12 +335,16 @@ def collect_weather_intermediate(controlnet: torch.nn.Module
 def _patch_timed_c2f_fixed_gamma(controlnet: torch.nn.Module, fixed_gamma: float) -> List:
     """
     对每个 TimedC2FBlock, 把 forward 替换为强制 gamma = fixed_gamma 的版本.
-    返回 handles 列表, 用于事后恢复.
+    返回 handles 列表 (block 引用), 用于事后恢复原 forward.
+
+    关键: 必须赋 raw function 而非 bound method, 否则 nn.Module._call_impl
+    调用 self.forward(*args) 时, bound method 会再自动传 self, 导致签名错位.
     """
     if not is_weather_controlnet(controlnet):
         return []
 
-    def _make_new_forward(orig_time_emb, orig_time_mlp, orig_c2f, fg: float):
+    def _make_new_forward(orig_time_emb, orig_c2f, fg: float):
+        # 闭包捕获 orig_time_emb/orig_c2f/fg. 接受 (x, timestep), 不接受 self.
         def new_forward(x, timestep):
             if not torch.is_tensor(timestep):
                 timestep = torch.tensor([timestep] * x.shape[0], device=x.device)
@@ -350,20 +354,18 @@ def _patch_timed_c2f_fixed_gamma(controlnet: torch.nn.Module, fixed_gamma: float
                 timestep = timestep.expand(x.shape[0])
             target_dtype = x.dtype
             te = orig_time_emb(timestep).to(target_dtype)
-            # 关键: gamma 强制为常数, 忽略 time_mlp 实际输出
             gamma = torch.full((x.shape[0], 1), fg, device=x.device, dtype=target_dtype)
             refined = orig_c2f(x)
             scale = 1.0 + 0.2 * gamma.view(-1, 1, 1, 1)
             return refined * scale
         return new_forward
 
-    import types
     handles = []
     for blk in controlnet.timed_c2f_blocks:
         blk._orig_forward = blk.forward
-        blk.forward = types.MethodType(
-            _make_new_forward(blk.time_emb, blk.time_mlp, blk.c2f, fixed_gamma), blk,
-        )
+        # 关键: 赋 raw function (不绑定 self), nn.Module._call_impl 调
+        # self.forward(*args) 时, raw function 不会自动传 self, 签名 (x, timestep) 正确.
+        blk.forward = _make_new_forward(blk.time_emb, blk.c2f, fixed_gamma)
         handles.append(blk)
     return handles
 
