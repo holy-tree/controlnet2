@@ -94,8 +94,12 @@ class ARCAResidualCalibrator(nn.Module):
         # 5) ZeroConv (1x1, 0-init)
         self.zero_conv = _zero_conv(out_channels, out_channels)
 
-        # 6) 分层独立可学习缩放 alpha (init=0, tanh 限到 [-1, 1])
-        self.alpha = nn.Parameter(torch.zeros(1), requires_grad=True)
+        # 6) 分层独立可学习缩放 alpha.
+        # 论文方案: 初始值 0.1 (而非 0). 原因:
+        #   - alpha=0 + zero_conv 0-init 会形成死锁 (residual=0, d_residual/d_alpha=0, 永远不学)
+        #   - 初始 0.1 配合 tanh 限到 [-1, 1], 残差幅度受 zero_conv 权重二次约束, 不会污染 SD 预训练
+        #   - 但 alpha 梯度链路立刻打通, 训练能持续学
+        self.alpha = nn.Parameter(torch.full((1,), 0.1), requires_grad=True)
 
         # 残差 cache: 训练时序监控需要 std(res), 缓存在 self._last_residual_stats
         # 仅在 self.training 模式下填充, 避免污染推理路径
@@ -168,20 +172,36 @@ def format_arca_monitor(records: list[dict], unet_hidden_stds: list[float] | Non
     """
     渲染监控表:
       header:  stage | alpha | tanh(alpha) | scale | res_std | unet_std | R
-    unet_hidden_stds: 与 records 等长的列表, 给出同位置 UNet 隐特征 std
-                      (调用方负责在 forward 中抓取并对齐顺序)
+    unet_hidden_stds: 与 records 等长的列表, 给出同位置 UNet 隐特征 std.
+                      若为 None 或长度不匹配, unet_std / R 列显示 N/A.
+                      论文 method 章节做消融时由调用方 hook UNet 提供.
     """
-    lines = ["# ARCA 监控",
-             f"{'name':<42} {'alpha':>10} {'tanh':>8} {'scale':>8} "
-             f"{'res_std':>11} {'unet_std':>11} {'R':>9}"]
+    has_unet = (unet_hidden_stds is not None and len(unet_hidden_stds) == len(records))
+    lines = ["# ARCA 监控"]
+    if has_unet:
+        lines.append(
+            f"{'name':<42} {'alpha':>10} {'tanh':>8} {'scale':>8} "
+            f"{'res_std':>11} {'unet_std':>11} {'R':>9}"
+        )
+    else:
+        lines.append(
+            f"{'name':<42} {'alpha':>10} {'tanh':>8} {'scale':>8} {'res_std':>11}  "
+            f"(unet_std/R 需 hook UNet 提供)"
+        )
     lines.append("-" * 100)
     for i, r in enumerate(records):
-        unet_std = (unet_hidden_stds[i] if unet_hidden_stds is not None else float("nan"))
-        res_std = r.get("std", float("nan"))
-        r_ratio = (res_std / unet_std) if (unet_std and unet_std > 0) else float("nan")
         scale = r.get("scale", float("nan"))
-        lines.append(
-            f"{r['name']:<42} {r['alpha']:>10.4f} {r['tanh_alpha']:>8.4f} {scale:>8.4f} "
-            f"{res_std:>11.4e} {unet_std:>11.4e} {r_ratio:>9.4f}"
-        )
+        res_std = r.get("std", float("nan"))
+        if has_unet:
+            unet_std = unet_hidden_stds[i]
+            r_ratio = (res_std / unet_std) if (unet_std and unet_std > 0) else float("nan")
+            lines.append(
+                f"{r['name']:<42} {r['alpha']:>10.4f} {r['tanh_alpha']:>8.4f} {scale:>8.4f} "
+                f"{res_std:>11.4e} {unet_std:>11.4e} {r_ratio:>9.4f}"
+            )
+        else:
+            lines.append(
+                f"{r['name']:<42} {r['alpha']:>10.4f} {r['tanh_alpha']:>8.4f} {scale:>8.4f} "
+                f"{res_std:>11.4e}    N/A                  N/A"
+            )
     return "\n".join(lines)
