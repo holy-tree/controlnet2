@@ -1591,8 +1591,13 @@ def run_epoch_validation(vae, unet, controlnet, text_encoder, tokenizer, acceler
             logger.warn(f"[Epoch {epoch}] 没有 {weather} 类别的样本, 跳过")
             continue
 
-        # 固定种子以便复现
-        random.seed(epoch * 1000 + hash(weather) % 1000)
+        # 固定种子以便跨 epoch 复现 val 集:
+        #   - 种子只依赖 weather (与 epoch 无关), 保证同一 weather 在所有 epoch 用同一组 val 图
+        #   - 用 hashlib 取代 hash() 以避免 Python 3.3+ 默认 hash 随机化 (PYTHONHASHSEED=random)
+        #   - base 0 + weather-derived offset, 保证三种 weather 的 val 集互不重叠
+        import hashlib
+        weather_seed = int(hashlib.md5(weather.encode('utf-8')).hexdigest()[:8], 16) % (2**31)
+        random.seed(weather_seed)
         selected = random.sample(candidates, min(num_samples, len(candidates)))
 
         weather_dir = val_root / weather
