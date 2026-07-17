@@ -130,6 +130,12 @@ DEFAULT_CONFIG: Dict = {
     "residual_abs_mean_min_healthy": 1e-3,
     "residual_abs_mean_max_healthy": 1.0,
     "ablation_psnr_drop_db": 0.1,
+    # 实验 A: 把控制残差乘 0.1, 验证残差幅值爆炸是色块根源
+    "exp_a_scale": 0.1,
+    # 实验 C: 固定 TimedC2F 的 gamma, 关闭动态时序缩放
+    "exp_c_gamma": 0.5,
+    # 选用哪些实验: "none" / "a" / "b" / "c" / "ab" / "abc" / "all"
+    "experiments": "abc",
 }
 
 
@@ -163,6 +169,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mixed_precision", type=str, default=None,
                         choices=["no", "fp16", "bf16"])
     parser.add_argument("--lpips_net", type=str, default=None, choices=["alex", "vgg"])
+    parser.add_argument("--experiments", type=str, default=None,
+                        help="启用哪些实验: a=cond_scale=0.1 残差压制; "
+                             "b=C2F/Adapter/zero_conv 三段幅值统计; "
+                             "c=固定 TimedC2F gamma. 例: 'abc' / 'a,c' / 'none'")
+    parser.add_argument("--exp_a_scale", type=float, default=None,
+                        help="实验 A 的控制残差缩放系数 (默认 0.1)")
+    parser.add_argument("--exp_c_gamma", type=float, default=None,
+                        help="实验 C 固定的 gamma 值 (默认 0.5, 关闭动态时序)")
     parser.add_argument("--cpu", action="store_true", help="强制使用 CPU")
     return parser.parse_args()
 
@@ -189,10 +203,22 @@ def merge_config(args: argparse.Namespace) -> Dict:
         "seed": args.seed,
         "mixed_precision": args.mixed_precision,
         "lpips_net": args.lpips_net,
+        "exp_a_scale": args.exp_a_scale,
+        "exp_c_gamma": args.exp_c_gamma,
     }
     for k, v in overrides.items():
         if v is not None:
             cfg[k] = v
+
+    # 解析 --experiments 字符串 -> set of {a,b,c}
+    raw = (args.experiments if args.experiments is not None else cfg.get("experiments", "abc"))
+    raw_norm = raw.replace(",", "").replace(" ", "").lower()
+    if raw_norm in ("none", "", "off"):
+        cfg["_experiments"] = set()
+    elif raw_norm in ("all", "abc"):
+        cfg["_experiments"] = {"a", "b", "c"}
+    else:
+        cfg["_experiments"] = {c for c in raw_norm if c in "abc"}
 
     if args.cpu:
         cfg["_force_cpu"] = True
@@ -277,6 +303,78 @@ def collect_zero_convs(controlnet: torch.nn.Module) -> List[Tuple[str, torch.nn.
     return found
 
 
+def is_weather_controlnet(controlnet: torch.nn.Module) -> bool:
+    """检测是否为项目自定义的 WeatherRestorationControlNet (有 c2f / adapter)."""
+    return hasattr(controlnet, "timed_c2f_blocks") and hasattr(controlnet, "adapters") \
+        and hasattr(controlnet, "weather_encoder")
+
+
+def collect_weather_intermediate(controlnet: torch.nn.Module
+                                  ) -> Tuple[List[Tuple[str, torch.nn.Module]],
+                                             List[Tuple[str, torch.nn.Module]]]:
+    """
+    仅在 WeatherRestorationControlNet 下有定义.
+    返回 (c2f_outputs, adapter_outputs):
+      c2f_outputs: 4 个 TimedC2FBlock.c2f 子模块 (C2F 主干出口)
+      adapter_outputs: 4 个 LightweightAdapter
+    """
+    c2f_list: List[Tuple[str, torch.nn.Module]] = []
+    adapter_list: List[Tuple[str, torch.nn.Module]] = []
+    if not is_weather_controlnet(controlnet):
+        return c2f_list, adapter_list
+    for i, blk in enumerate(controlnet.timed_c2f_blocks):
+        c2f_list.append((f"timed_c2f_blocks.{i}.c2f", blk.c2f))
+    for i, adp in enumerate(controlnet.adapters):
+        adapter_list.append((f"adapters.{i}", adp))
+    return c2f_list, adapter_list
+
+
+# =============================================================================
+# 实验 C: monkey-patch TimedC2FBlock.forward 强制 gamma 固定
+# =============================================================================
+def _patch_timed_c2f_fixed_gamma(controlnet: torch.nn.Module, fixed_gamma: float) -> List:
+    """
+    对每个 TimedC2FBlock, 把 forward 替换为强制 gamma = fixed_gamma 的版本.
+    返回 handles 列表, 用于事后恢复.
+    """
+    if not is_weather_controlnet(controlnet):
+        return []
+
+    def _make_new_forward(orig_time_emb, orig_time_mlp, orig_c2f, fg: float):
+        def new_forward(x, timestep):
+            if not torch.is_tensor(timestep):
+                timestep = torch.tensor([timestep] * x.shape[0], device=x.device)
+            if timestep.ndim == 0:
+                timestep = timestep.unsqueeze(0).expand(x.shape[0])
+            elif timestep.shape[0] == 1 and x.shape[0] > 1:
+                timestep = timestep.expand(x.shape[0])
+            target_dtype = x.dtype
+            te = orig_time_emb(timestep).to(target_dtype)
+            # 关键: gamma 强制为常数, 忽略 time_mlp 实际输出
+            gamma = torch.full((x.shape[0], 1), fg, device=x.device, dtype=target_dtype)
+            refined = orig_c2f(x)
+            scale = 1.0 + 0.2 * gamma.view(-1, 1, 1, 1)
+            return refined * scale
+        return new_forward
+
+    import types
+    handles = []
+    for blk in controlnet.timed_c2f_blocks:
+        blk._orig_forward = blk.forward
+        blk.forward = types.MethodType(
+            _make_new_forward(blk.time_emb, blk.time_mlp, blk.c2f, fixed_gamma), blk,
+        )
+        handles.append(blk)
+    return handles
+
+
+def _unpatch_timed_c2f(handles: List) -> None:
+    for blk in handles:
+        if hasattr(blk, "_orig_forward"):
+            blk.forward = blk._orig_forward
+            del blk._orig_forward
+
+
 # =============================================================================
 # [1] 权重范数检查
 # =============================================================================
@@ -335,14 +433,15 @@ def check_weight_norms(
 # [2] 前向残差统计 (用 forward hook 抓 zero_conv 输出)
 # =============================================================================
 class _ResidualStatHook:
-    """对每个 zero_conv 注册 forward hook, 记录 (mean, max) of |out|."""
+    """对每个 zero_conv 注册 forward hook, 记录 (mean, std, abs_mean, abs_max) of out."""
 
-    def __init__(self) -> None:
-        self.records: List[Dict] = []   # [{name, mean, max, shape, numel}, ...]
+    def __init__(self, record_signed: bool = False) -> None:
+        self.records: List[Dict] = []
         self._handles: List[torch.utils.hooks.RemovableHandle] = []
+        self._record_signed = record_signed  # 实验 B 还要 mean/std/min/max, 而非只看 |·|
 
-    def attach(self, zero_convs: List[Tuple[str, torch.nn.Module]]) -> None:
-        for name, mod in zero_convs:
+    def attach(self, mods: List[Tuple[str, torch.nn.Module]]) -> None:
+        for name, mod in mods:
             handle = mod.register_forward_hook(self._make_hook(name))
             self._handles.append(handle)
 
@@ -355,13 +454,21 @@ class _ResidualStatHook:
         def hook(_mod, _inp, out):
             with torch.no_grad():
                 t = out.detach().float()
-                self.records.append({
+                rec = {
                     "name": name,
                     "abs_mean": t.abs().mean().item(),
                     "abs_max": t.abs().max().item(),
                     "shape": list(t.shape),
                     "numel": int(t.numel()),
-                })
+                }
+                if self._record_signed:
+                    rec.update({
+                        "mean": t.mean().item(),
+                        "std": t.std().item(),
+                        "min": t.min().item(),
+                        "max": t.max().item(),
+                    })
+                self.records.append(rec)
         return hook
 
 
@@ -436,14 +543,25 @@ def check_residual_stats(
     lq_pil: Image.Image,
     cfg: Dict,
     out_dir: Path,
+    include_intermediate: bool = False,
 ) -> Dict:
+    """
+    默认只统计 zero_conv 输出 (abs mean / max). 实验 B 启用时, 同时 hook
+    C2F 主干出口 + Adapter 出口, 统计 mean / std / min / max 全套幅值信息.
+    """
     zero_convs = collect_zero_convs(controlnet)
     if not zero_convs:
         print("[2/3] 警告: 未发现任何 zero_conv.")
-        return {"records": [], "summary": {}}
+        return {"records": [], "summary": {}, "intermediate": []}
 
-    hook = _ResidualStatHook()
-    hook.attach(zero_convs)
+    targets: List[Tuple[str, torch.nn.Module]] = list(zero_convs)
+    c2f_targets, adapter_targets = [], []
+    if include_intermediate and is_weather_controlnet(controlnet):
+        c2f_targets, adapter_targets = collect_weather_intermediate(controlnet)
+        targets = c2f_targets + adapter_targets + zero_convs
+
+    hook = _ResidualStatHook(record_signed=include_intermediate)
+    hook.attach(targets)
     try:
         _run_controlnet_forward_only(pipeline, lq_pil, cfg, hook)
     finally:
@@ -451,32 +569,87 @@ def check_residual_stats(
 
     if not hook.records:
         print("[2/3] 警告: forward hook 未抓到任何 zero_conv 输出.")
-        return {"records": [], "summary": {}}
+        return {"records": [], "summary": {}, "intermediate": []}
 
+    # ---- 写 zero_conv 部分的旧格式 (兼容原 summary) ----
+    zc_records = [r for r in hook.records if r["name"] in {n for n, _ in zero_convs}]
     lines = ["# 控制残差 (zero_conv 输出) abs 统计  正常区间 1e-2 ~ 1.0",
-             f"# 共 {len(hook.records)} 次 zero_conv forward   阈值 "
+             f"# 共 {len(zc_records)} 次 zero_conv forward   阈值 "
              f"|.| mean in [{cfg['residual_abs_mean_min_healthy']:.1e}, "
              f"{cfg['residual_abs_mean_max_healthy']:.1e}]\n"]
     header = f"{'name':<32} {'abs_mean':>14} {'abs_max':>14}  {'shape':<22}"
     lines.append(header)
     lines.append("-" * len(header))
-    for r in hook.records:
+    for r in zc_records:
         lines.append(f"{r['name']:<32} {r['abs_mean']:>14.6e} {r['abs_max']:>14.6e}  {str(r['shape']):<22}")
     text = "\n".join(lines)
     _safe_print(text)
     (out_dir / "residual_stats.txt").write_text(text + "\n", encoding="utf-8")
 
-    means = [r["abs_mean"] for r in hook.records]
-    maxs = [r["abs_max"] for r in hook.records]
+    means = [r["abs_mean"] for r in zc_records]
+    maxs = [r["abs_max"] for r in zc_records]
     summary = {
-        "num_records": len(hook.records),
-        "abs_mean_min": float(min(means)),
-        "abs_mean_max": float(max(means)),
-        "abs_mean_mean": float(np.mean(means)),
-        "abs_mean_median": float(np.median(means)),
-        "abs_max_global": float(max(maxs)),
+        "num_records": len(zc_records),
+        "abs_mean_min": float(min(means)) if means else 0.0,
+        "abs_mean_max": float(max(means)) if means else 0.0,
+        "abs_mean_mean": float(np.mean(means)) if means else 0.0,
+        "abs_mean_median": float(np.median(means)) if means else 0.0,
+        "abs_max_global": float(max(maxs)) if maxs else 0.0,
     }
-    return {"records": hook.records, "summary": summary}
+
+    intermediate: List[Dict] = []
+    if include_intermediate and c2f_targets:
+        intermediate = [r for r in hook.records if r["name"] not in {n for n, _ in zero_convs}]
+        _write_intermediate_stats(intermediate, c2f_targets, adapter_targets, out_dir)
+
+    return {"records": zc_records, "summary": summary, "intermediate": intermediate}
+
+
+def _write_intermediate_stats(
+    intermediate: List[Dict],
+    c2f_targets: List[Tuple[str, torch.nn.Module]],
+    adapter_targets: List[Tuple[str, torch.nn.Module]],
+    out_dir: Path,
+) -> None:
+    """实验 B: 写 C2F/Adapter 中间段幅值 (mean/std/min/max)."""
+    by_name = {r["name"]: r for r in intermediate}
+    c2f_names = {n for n, _ in c2f_targets}
+    adp_names = {n for n, _ in adapter_targets}
+
+    lines = ["# 实验 B: C2F -> Adapter -> zero_conv 三段幅值统计",
+             "# 重点观察 mean / std / |max| 的逐级放大倍数.\n"]
+
+    def _block(title: str, names: List[str]):
+        lines.append(f"## {title}")
+        lines.append(f"{'name':<32} {'mean':>13} {'std':>13} {'|min|':>13} {'|max|':>13}  shape")
+        lines.append("-" * 100)
+        for n in names:
+            r = by_name.get(n)
+            if r is None:
+                lines.append(f"{n:<32} (not found)")
+                continue
+            lines.append(f"{n:<32} {r['mean']:>13.4e} {r['std']:>13.4e} "
+                         f"{abs(r['min']):>13.4e} {r['max']:>13.4e}  {str(r['shape'])}")
+        lines.append("")
+
+    if c2f_names:
+        _block("C2F 主干出口 (timed_c2f_blocks[i].c2f)", [n for n, _ in c2f_targets])
+    if adp_names:
+        _block("Adapter 出口 (adapters[i])", [n for n, _ in adapter_targets])
+
+    # 放大倍数分析: Adapter / C2F
+    lines.append("## 放大倍数分析 (每 stage: adapter_abs_max / c2f_abs_max)")
+    lines.append(f"{'stage':<10} {'c2f_|max|':>14} {'adapter_|max|':>14}  ratio")
+    lines.append("-" * 60)
+    for i in range(len(c2f_targets)):
+        c2f_r = by_name.get(c2f_targets[i][0])
+        adp_r = by_name.get(adapter_targets[i][0])
+        if c2f_r and adp_r:
+            ratio = adp_r["abs_max"] / max(c2f_r["abs_max"], 1e-12)
+            lines.append(f"stage_{i:<3} {c2f_r['abs_max']:>14.4e} {adp_r['abs_max']:>14.4e}  x{ratio:>8.2f}")
+    text = "\n".join(lines)
+    _safe_print("\n" + text + "\n")
+    (out_dir / "intermediate_stats.txt").write_text(text + "\n", encoding="utf-8")
 
 
 # =============================================================================
@@ -546,80 +719,132 @@ def run_ablation(
     device: torch.device,
     autocast_dtype: Optional[torch.dtype],
 ) -> Dict:
+    experiments: set = cfg.get("_experiments", set()) or set()
+    exp_a = experiments and "a" in experiments
+    exp_c = experiments and "c" in experiments
+    is_weather = is_weather_controlnet(pipeline.controlnet)
+    if exp_c and not is_weather:
+        print("[3/3] 实验 C 需要 WeatherRestorationControlNet (无 c2f / adapter), 跳过.")
+        exp_c = False
+
     print(f"[3/3] 消融推理  seed={cfg['seed']}  resolution={cfg['resolution']}  "
-          f"steps={cfg['num_inference_steps']}  cfg={cfg['guidance_scale']}")
+          f"steps={cfg['num_inference_steps']}  cfg={cfg['guidance_scale']}  "
+          f"experiments=A:{exp_a} C:{exp_c}")
 
     lq_pil = lq_pil.convert("RGB").resize((cfg["resolution"], cfg["resolution"]), Image.BICUBIC)
     if gt_pil is not None:
         gt_pil = gt_pil.convert("RGB").resize((cfg["resolution"], cfg["resolution"]), Image.BICUBIC)
 
-    t0 = time.time()
-    pred_with = _infer_one(pipeline, lq_pil, cfg, 1.0, device, autocast_dtype)
-    t_with = time.time() - t0
-    t0 = time.time()
-    pred_without = _infer_one(pipeline, lq_pil, cfg, 0.0, device, autocast_dtype)
-    t_without = time.time() - t0
-    print(f"      cond=1.0 用时 {t_with:.2f}s,  cond=0.0 用时 {t_without:.2f}s")
+    # ---- 准备实验列表 ----
+    # (key, label, cond_scale, exp_c_gamma 或 None)
+    runs: List[Tuple[str, str, float, Optional[float]]] = [
+        ("cond0.0", "pred (cond=0.0, baseline)", 0.0, None),
+        ("cond1.0", "pred (cond=1.0, original)", 1.0, None),
+    ]
+    if exp_a:
+        runs.append((
+            f"expA_cond{cfg['exp_a_scale']:.2f}".rstrip("0").rstrip("."),
+            f"pred (cond={cfg['exp_a_scale']}, A=scale down)",
+            float(cfg["exp_a_scale"]), None,
+        ))
+    if exp_c:
+        runs.append((
+            f"expC_gamma{cfg['exp_c_gamma']:.2f}".rstrip("0").rstrip("."),
+            f"pred (gamma={cfg['exp_c_gamma']}, C=fixed gamma)",
+            1.0, float(cfg["exp_c_gamma"]),
+        ))
+
+    # ---- 逐个推理 ----
+    preds: Dict[str, Image.Image] = {}
+    times: Dict[str, float] = {}
+    for key, _label, cond, fixed_gamma in runs:
+        patched_handles = []
+        if fixed_gamma is not None:
+            patched_handles = _patch_timed_c2f_fixed_gamma(pipeline.controlnet, fixed_gamma)
+        try:
+            t0 = time.time()
+            preds[key] = _infer_one(pipeline, lq_pil, cfg, cond, device, autocast_dtype)
+            times[key] = time.time() - t0
+            print(f"      {key} (cond={cond}, gamma={fixed_gamma}) 用时 {times[key]:.2f}s")
+        finally:
+            _unpatch_timed_c2f(patched_handles)
 
     stem = Path(cfg["lq_image_path"]).stem
-    pred_with.save(out_dir / f"{stem}_cond1.0_pred.png")
-    pred_without.save(out_dir / f"{stem}_cond0.0_pred.png")
+    for key, pil in preds.items():
+        pil.save(out_dir / f"{stem}_{key}_pred.png")
     lq_pil.save(out_dir / f"{stem}_lq.png")
     if gt_pil is not None:
         gt_pil.save(out_dir / f"{stem}_gt.png")
 
-    # 指标 (有 GT 时才有意义)
+    # ---- 指标 (有 GT 时才有意义) ----
     metrics: Dict = {}
     if gt_pil is not None:
         gt_t = _pil_to_unit_tensor(gt_pil, device)
-        with_t = _pil_to_unit_tensor(pred_with, device)
-        without_t = _pil_to_unit_tensor(pred_without, device)
-        m_with = {
-            "psnr": calc_psnr(with_t, gt_t),
-            "ssim": calc_ssim(with_t, gt_t),
-        }
-        m_without = {
-            "psnr": calc_psnr(without_t, gt_t),
-            "ssim": calc_ssim(without_t, gt_t),
-        }
-        # LPIPS 懒加载 (避免非消融模式强行下载)
+        lq_t = _pil_to_unit_tensor(lq_pil, device)
+        for key, pil in preds.items():
+            t = _pil_to_unit_tensor(pil, device)
+            metrics[key] = {
+                "psnr": calc_psnr(t, gt_t),
+                "ssim": calc_ssim(t, gt_t),
+            }
+        # LPIPS 懒加载
         try:
             _ = _get_lpips_model(cfg.get("lpips_net", "alex"), device=device)
-            m_with["lpips"] = calc_lpips(with_t, gt_t, net=cfg.get("lpips_net", "alex"))
-            m_without["lpips"] = calc_lpips(without_t, gt_t, net=cfg.get("lpips_net", "alex"))
+            for key, pil in preds.items():
+                t = _pil_to_unit_tensor(pil, device)
+                metrics[key]["lpips"] = calc_lpips(t, gt_t, net=cfg.get("lpips_net", "alex"))
         except Exception as e:
             print(f"      LPIPS 跳过: {e}")
-            m_with["lpips"] = float("nan")
-            m_without["lpips"] = float("nan")
+            for key in preds:
+                metrics[key]["lpips"] = float("nan")
 
-        metrics = {
-            "cond1.0": m_with,
-            "cond0.0": m_without,
-            "delta_psnr": m_with["psnr"] - m_without["psnr"],
-            "delta_ssim": m_with["ssim"] - m_without["ssim"],
-            "delta_lpips": (
-                (m_with["lpips"] - m_without["lpips"])
-                if not (m_with["lpips"] != m_with["lpips"]) else float("nan")
-            ),
-        }
-        # 与 LQ 的 PSNR (看 LQ→GT 距离, 供解读)
-        lq_t = _pil_to_unit_tensor(lq_pil, device)
+        # Δ 全部以 cond=0.0 为基线 (也支持与 cond=1.0 对比)
+        baseline = metrics.get("cond0.0", {})
+        for key, m in metrics.items():
+            d = {}
+            for k in ("psnr", "ssim", "lpips"):
+                if k in m and k in baseline and not (m[k] != m[k]) and not (baseline[k] != baseline[k]):
+                    d[f"delta_{k}_vs_baseline"] = m[k] - baseline[k]
+            m.update(d)
+        # 与 LQ 的 PSNR
         metrics["lq_to_gt_psnr"] = calc_psnr(lq_t, gt_t)
         metrics["lq_to_gt_ssim"] = calc_ssim(lq_t, gt_t)
 
-    # 横排对比图
-    grid_imgs = [lq_pil, pred_with, pred_without] + ([gt_pil] if gt_pil is not None else [])
-    grid_labels = ["LQ", "pred (cond=1.0)", "pred (cond=0.0)"] + (["GT"] if gt_pil is not None else [])
+    # ---- 横排对比图 (LQ | 每个实验 | GT) ----
+    grid_imgs = [lq_pil]
+    grid_labels = ["LQ"]
+    for key, label, _c, _g in runs:
+        grid_imgs.append(preds[key])
+        grid_labels.append(label)
+    if gt_pil is not None:
+        grid_imgs.append(gt_pil)
+        grid_labels.append("GT")
     _make_grid_4(grid_imgs, grid_labels).save(out_dir / "ablation_grid.png")
 
-    # 控制残差视觉差图
-    diff = np.abs(np.asarray(pred_with, dtype=np.int16) - np.asarray(pred_without, dtype=np.int16))
-    diff = np.clip(diff * 4, 0, 255).astype(np.uint8)   # ×4 增强显示
-    Image.fromarray(diff).save(out_dir / f"{stem}_abs_diff_x4.png")
+    # 控制残差视觉差图 (cond=1.0 vs cond=0.0)
+    if "cond1.0" in preds and "cond0.0" in preds:
+        diff = np.abs(np.asarray(preds["cond1.0"], dtype=np.int16)
+                      - np.asarray(preds["cond0.0"], dtype=np.int16))
+        diff = np.clip(diff * 4, 0, 255).astype(np.uint8)
+        Image.fromarray(diff).save(out_dir / f"{stem}_abs_diff_cond1_vs_0_x4.png")
+    # A 实验 vs cond=0.0 差图 (看压制后的差异)
+    for key in preds:
+        if key.startswith("expA") and "cond0.0" in preds:
+            diff = np.abs(np.asarray(preds[key], dtype=np.int16)
+                          - np.asarray(preds["cond0.0"], dtype=np.int16))
+            diff = np.clip(diff * 4, 0, 255).astype(np.uint8)
+            Image.fromarray(diff).save(out_dir / f"{stem}_abs_diff_{key}_vs_0_x4.png")
+        if key.startswith("expC") and "cond1.0" in preds:
+            diff = np.abs(np.asarray(preds[key], dtype=np.int16)
+                          - np.asarray(preds["cond1.0"], dtype=np.int16))
+            diff = np.clip(diff * 4, 0, 255).astype(np.uint8)
+            Image.fromarray(diff).save(out_dir / f"{stem}_abs_diff_{key}_vs_1_x4.png")
 
     return {
         "metrics": metrics,
-        "inference_time_sec": {"cond1.0": t_with, "cond0.0": t_without},
+        "inference_time_sec": times,
+        "runs": [{"key": k, "label": lab, "cond_scale": c, "fixed_gamma": g}
+                 for k, lab, c, g in runs],
     }
 
 
@@ -696,7 +921,8 @@ def main() -> None:
     print(f"[init] 输出目录: {out_dir}")
 
     results: Dict = {"config": snapshot, "weight_norms": None,
-                     "residual_stats": None, "ablation": None}
+                     "residual_stats": None, "ablation": None,
+                     "experiments": list(cfg["_experiments"])}
 
     # ------ [1] 权重范数 (不依赖 LQ 图, 直接加载 checkpoint) ------
     if cfg["mode"] in ("all", "weights_only"):
@@ -720,19 +946,27 @@ def main() -> None:
         else:
             print(f"[warn] 未提供有效 GT 图, 消融 PSNR 仍会跑, 但跳过 SSIM/LPIPS/对比")
 
-        # ------ [2] 前向残差统计 ------
+        # ------ [2] 前向残差统计 (+ 实验 B 中间段幅值) ------
         if cfg["mode"] in ("all", "residuals_only"):
             print("\n" + "=" * 70)
-            print("[2/3] 控制残差 (zero_conv 输出) 前向数值  (一次前向, 无需 denoising)")
+            label_b = "+ 实验 B 中间段 (C2F/Adapter/zero_conv 三段)" if "b" in cfg["_experiments"] else ""
+            print(f"[2/3] 控制残差 (zero_conv 输出) 前向数值  {label_b}")
             print("=" * 70)
             results["residual_stats"] = check_residual_stats(
                 pipeline.controlnet, pipeline, lq_pil, cfg, out_dir,
+                include_intermediate="b" in cfg["_experiments"],
             )
 
-        # ------ [3] 消融对比 ------
+        # ------ [3] 消融对比 (+ 实验 A cond=0.1 / 实验 C gamma=0.5) ------
         if cfg["mode"] in ("all", "ablation"):
             print("\n" + "=" * 70)
-            print("[3/3] 消融对比: cond=1.0 vs cond=0.0")
+            extra = []
+            if "a" in cfg["_experiments"]:
+                extra.append(f"实验 A (cond_scale={cfg['exp_a_scale']})")
+            if "c" in cfg["_experiments"]:
+                extra.append(f"实验 C (gamma={cfg['exp_c_gamma']})")
+            extra_str = " + ".join(extra) if extra else "(仅 cond=0.0 vs 1.0)"
+            print(f"[3/3] 消融推理  {extra_str}")
             print("=" * 70)
             results["ablation"] = run_ablation(
                 pipeline, lq_pil, gt_pil, cfg, out_dir, device, autocast_dtype,
@@ -783,6 +1017,7 @@ def _write_summary(results: Dict, cfg: Dict, out_dir: Path) -> None:
                 f"[2/3] [OK] 控制残差数值处于正常区间 (abs mean ~= {m:.2e}).")
 
     if ab:
+        # 旧指标: cond=1.0 vs cond=0.0 (兼容老 summary)
         d_psnr = ab.get("delta_psnr")
         if d_psnr is None:
             pass
@@ -795,11 +1030,54 @@ def _write_summary(results: Dict, cfg: Dict, out_dir: Path) -> None:
                 f"[3/3] [OK] 消融 PSNR 差距 {d_psnr:+.3f} dB (cond=1.0 优于 cond=0.0), "
                 f"控制分支对画质有可观测的正向贡献.")
 
+        # 实验 A: 控制残差乘 0.1, 若色块根源是幅值爆炸, 此处 PSNR 应明显回升
+        runs_meta = (results.get("ablation") or {}).get("runs", [])
+        run_keys = [r["key"] for r in runs_meta]
+        exp_a_key = next((k for k in run_keys if k.startswith("expA")), None)
+        if exp_a_key and exp_a_key in ab and "cond0.0" in ab and "cond1.0" in ab:
+            psnr_a = ab[exp_a_key].get("psnr", float("nan"))
+            psnr_1 = ab["cond1.0"].get("psnr", float("nan"))
+            psnr_0 = ab["cond0.0"].get("psnr", float("nan"))
+            if psnr_a == psnr_a and psnr_1 == psnr_1 and psnr_0 == psnr_0:
+                if psnr_a > psnr_1:
+                    diagnostics.append(
+                        f"[实验 A] [BAD] cond={cfg['exp_a_scale']} 的 PSNR ({psnr_a:.3f}) "
+                        f"高于 cond=1.0 ({psnr_1:.3f}) 差 {psnr_a - psnr_1:+.3f} dB. "
+                        f"100% 确认控制残差幅值爆炸是色块根源; "
+                        f"建议永久加入可学习残差缩放 (alpha 初始 0.1).")
+                elif psnr_a < psnr_0:
+                    diagnostics.append(
+                        f"[实验 A] [BAD] cond={cfg['exp_a_scale']} 的 PSNR ({psnr_a:.3f}) "
+                        f"甚至低于 cond=0.0 基线 ({psnr_0:.3f}), 控制分支方向可能是反的 "
+                        f"或残差方向需检查.")
+                else:
+                    diagnostics.append(
+                        f"[实验 A] [WARN] cond={cfg['exp_a_scale']} ({psnr_a:.3f}) 与 "
+                        f"cond=1.0 ({psnr_1:.3f}) 差异不显著, 残差缩放可能不是主要矛盾.")
+
+        # 实验 C: 固定 gamma, 若动态时序是次要干扰, 画质变化应较小
+        exp_c_key = next((k for k in run_keys if k.startswith("expC")), None)
+        if exp_c_key and exp_c_key in ab and "cond1.0" in ab:
+            psnr_c = ab[exp_c_key].get("psnr", float("nan"))
+            psnr_1 = ab["cond1.0"].get("psnr", float("nan"))
+            if psnr_c == psnr_c and psnr_1 == psnr_1:
+                d = psnr_c - psnr_1
+                if abs(d) > cfg["ablation_psnr_drop_db"] * 2:  # > 0.2 dB 才算"明显"
+                    diagnostics.append(
+                        f"[实验 C] [WARN] gamma={cfg['exp_c_gamma']} 的 PSNR ({psnr_c:.3f}) "
+                        f"与 cond=1.0 ({psnr_1:.3f}) 差 {d:+.3f} dB, "
+                        f"动态时序对画质有明显影响, 建议同步修改 TimedC2F.")
+                else:
+                    diagnostics.append(
+                        f"[实验 C] [OK] gamma={cfg['exp_c_gamma']} 与原始动态 gamma 差 {d:+.3f} dB, "
+                        f"时序模块影响不大, 可暂时搁置, 优先修 Adapter/残差缩放.")
+
     summary = {
         "weight_norms": wn,
         "residual_stats": rs,
         "ablation": results.get("ablation"),
         "diagnostics": diagnostics,
+        "experiments_enabled": results.get("experiments", []),
     }
     with io.open(out_dir / "summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
@@ -826,22 +1104,30 @@ def _write_summary(results: Dict, cfg: Dict, out_dir: Path) -> None:
                   f"  abs max 全局最大: {rs.get('abs_max_global', 0):.2e}",
                   ""]
     if ab:
-        lines += ["[3/3] 消融 PSNR 对比:",
-                  f"  cond=1.0  PSNR/SSIM/LPIPS: "
-                  f"{ab.get('cond1.0', {}).get('psnr', float('nan')):.3f} / "
-                  f"{ab.get('cond1.0', {}).get('ssim', float('nan')):.4f} / "
-                  f"{ab.get('cond1.0', {}).get('lpips', float('nan')):.4f}",
-                  f"  cond=0.0  PSNR/SSIM/LPIPS: "
-                  f"{ab.get('cond0.0', {}).get('psnr', float('nan')):.3f} / "
-                  f"{ab.get('cond0.0', {}).get('ssim', float('nan')):.4f} / "
-                  f"{ab.get('cond0.0', {}).get('lpips', float('nan')):.4f}",
-                  f"  delta PSNR (1.0 - 0.0): {ab.get('delta_psnr', float('nan')):+.4f} dB",
-                  f"  delta SSIM (1.0 - 0.0): {ab.get('delta_ssim', float('nan')):+.4f}",
-                  f"  delta LPIPS(1.0 - 0.0): {ab.get('delta_lpips', float('nan')):+.4f}  (负值=cond=1.0 更优)",
-                  f"  LQ->GT  PSNR/SSIM: "
-                  f"{ab.get('lq_to_gt_psnr', float('nan')):.3f} / "
-                  f"{ab.get('lq_to_gt_ssim', float('nan')):.4f}",
-                  ""]
+        # ---- 完整消融表 ----
+        lines += ["[3/3] 消融对比 (基线 cond=0.0):"]
+        runs_meta = (results.get("ablation") or {}).get("runs", [])
+        header = f"  {'key':<22} {'cond':>6} {'gamma':>6}  {'PSNR':>8} {'SSIM':>7} {'LPIPS':>7}  {'d_PSNR_vs_0':>13}"
+        lines.append(header)
+        lines.append("  " + "-" * (len(header) - 2))
+        for r in runs_meta:
+            k = r["key"]
+            m = ab.get(k, {})
+            d = m.get("delta_psnr_vs_baseline", float("nan"))
+            d_str = f"{d:+.3f} dB" if d == d else "  n/a"
+            lines.append(
+                f"  {k:<22} {r['cond_scale']:>6.2f} "
+                f"{(r['fixed_gamma'] if r['fixed_gamma'] is not None else float('nan')):>6.2f}  "
+                f"{m.get('psnr', float('nan')):>8.3f} {m.get('ssim', float('nan')):>7.4f} "
+                f"{m.get('lpips', float('nan')):>7.4f}  {d_str:>13}"
+            )
+        if "lq_to_gt_psnr" in ab:
+            lines += ["",
+                      f"  LQ->GT  PSNR/SSIM: "
+                      f"{ab.get('lq_to_gt_psnr', float('nan')):.3f} / "
+                      f"{ab.get('lq_to_gt_ssim', float('nan')):.4f}",
+                      ""]
+
     lines += ["判读建议:"]
     lines += [f"  {d}" for d in diagnostics] if diagnostics else ["  (无可用诊断)"]
     text = "\n".join(lines)
