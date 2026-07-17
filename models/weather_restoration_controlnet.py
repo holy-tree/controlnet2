@@ -286,8 +286,9 @@ class WeatherRestorationControlNet(ControlNetModel):
                         nn.init.ones_(m.weight)
                     if hasattr(m, 'bias') and m.bias is not None:
                         nn.init.zeros_(m.bias)
-            # 关键: alpha 初始 0 -> tanh(0)=0 -> 训练初残差恒为 0, 不破坏 SD 预训练
-            nn.init.zeros_(arca.alpha)
+            # 关键: alpha 初始 0.1 (论文方案第 6 节) — 避免与 zero_conv 0-init 死锁,
+            # 同时 0.1 量级残差不会破坏 SD 预训练; 训练中通过 tanh 限到 [-1, 1]
+            nn.init.constant_(arca.alpha, 0.1)
             # 防御性: zero_conv 已 0 init, 这里冗余保险
             nn.init.zeros_(arca.zero_conv.weight)
             if arca.zero_conv.bias is not None:
