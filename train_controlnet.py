@@ -102,15 +102,18 @@ def image_grid(imgs, rows, cols):
     return grid
 
 
-def _log_arca_monitor(controlnet, accelerator, global_step):
+def _log_arca_monitor(controlnet, accelerator, global_step, unet_stds=None):
     """
     ARCA 分层 alpha + 残差 std 监控 (论文 method 章节消融图表数据源).
 
     表格列:
-        name | alpha | tanh(alpha) | scale=last_residual_scale | res_std
+        name | alpha | tanh(alpha) | scale=last_residual_scale | res_std | unet_std | R
     备注:
         - res_std 来自 self.main_arca[i]._last_residual_stats, 由 ARCA.forward 在 training 模式缓存
-        - 主 stage 0/1/2/3 是 4 个 main_arca, 加 down_0/1 + mid 共 7 个 stage
+        - unet_stds: 7 个 UNet 主干 hidden 标准差 (按 main_arca[0..3] + down_arca[0..1] + mid_arca 顺序).
+                     None 时 R 列显示 N/A.
+        - R = res_std / unet_std: 控制残差相对 UNet 主干特征的大小.
+          R < 0.05 残差太小; 0.05~0.3 健康; > 0.5 残差过大开始污染 SD.
         - 用 accelerator.unwrap_model 取回原模型, 兼容 DDP/Accelerate 包装
     """
     try:
@@ -119,16 +122,127 @@ def _log_arca_monitor(controlnet, accelerator, global_step):
         records = collect_arca_monitor(raw)
         if not records:
             return
-        table = format_arca_monitor(records)
+        # unet_stds 必须长度匹配 (7), 否则置 None
+        if unet_stds is not None and len(unet_stds) != len(records):
+            unet_stds = None
+        table = format_arca_monitor(records, unet_hidden_stds=unet_stds)
         # logger.info 不支持多行字符串, 用分隔的 print
         for line in table.split("\n"):
             logger.info(f"[ARCA step {global_step:>6d}] {line}")
-        # 同时把 alpha 标量推到 tensorboard
+        # 同时把 alpha 标量 + R 比值推到 tensorboard
         for i, r in enumerate(records):
-            accelerator.log({f"arca/alpha_{i}": r["alpha"],
-                             f"arca/tanh_alpha_{i}": r["tanh_alpha"]}, step=global_step)
+            log_dict = {f"arca/alpha_{i}": r["alpha"],
+                        f"arca/tanh_alpha_{i}": r["tanh_alpha"]}
+            if unet_stds is not None and r.get("std") is not None:
+                unet_s = unet_stds[i] if unet_stds[i] > 0 else 1e-12
+                r_ratio = r["std"] / unet_s
+                log_dict[f"arca/R_{i}"] = r_ratio
+                log_dict[f"arca/unet_std_{i}"] = unet_stds[i]
+            accelerator.log(log_dict, step=global_step)
     except Exception as e:
         logger.warning(f"[ARCA] 监控打印失败: {e}")
+
+
+@torch.no_grad()
+def _capture_unet_baseline_stds(accelerator, controlnet, unet, vae, text_encoder,
+                                batch, weight_dtype, noise_scheduler,
+                                global_step):
+    """
+    抓 5 个 UNet 关键 hidden 位置 (down_blocks.0/1/2/3 + mid_block) 的 std.
+    跑 1 次额外的 unet forward (使用 ARCA 真实残差),
+    抓 5 个点 → 映射到 7 个 ARCA stage.
+
+    返回 7 个 std 列表 (按 main_arca[0..3] + down_arca[0..1] + mid_arca 顺序).
+    """
+    try:
+        raw_unet = accelerator.unwrap_model(unet)
+        raw_cn = accelerator.unwrap_model(controlnet)
+        if not hasattr(raw_unet, "down_blocks"):
+            return None
+    except Exception:
+        return None
+
+    # 准备 inputs
+    pixel_values = batch["pixel_values"].to(accelerator.device, dtype=weight_dtype)
+    with torch.no_grad():
+        latents = vae.encode(pixel_values).latent_dist.sample() * vae.config.scaling_factor
+    encoder_hidden_states = text_encoder(batch["input_ids"].to(accelerator.device))[0]
+
+    # 随机 timestep + noise (与训练时类似)
+    noise = torch.randn_like(latents)
+    timesteps = torch.randint(
+        0, int(noise_scheduler.config.num_train_timesteps),
+        (latents.shape[0],), device=latents.device,
+    ).long()
+    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+    # 用真实 controlnet 算 13 个 down_res + 1 mid_res
+    raw_cn.train(False)
+    with torch.no_grad():
+        down_res, mid_res = raw_cn(
+            noisy_latents,
+            timesteps,
+            encoder_hidden_states=encoder_hidden_states,
+            controlnet_cond=batch["conditioning_pixel_values"].to(accelerator.device, dtype=weight_dtype),
+            return_dict=False,
+        )
+
+    # 注册 post-hook 抓 down_blocks[0..3] + mid_block 输出 hidden
+    captured_stds = []  # 5 个, 顺序: [down_0, down_1, down_2, down_3, mid]
+
+    def make_hook():
+        def hook(module, input, output):
+            # ResNet block 输出: (h, ) tuple 或 tensor
+            h = output[0] if isinstance(output, tuple) else output
+            captured_stds.append(h.detach().float().std().item())
+        return hook
+
+    raw_unet.train(False)
+    handles = []
+    for i, db in enumerate(raw_unet.down_blocks):
+        handles.append(db.register_forward_hook(make_hook()))
+    handles.append(raw_unet.mid_block.register_forward_hook(make_hook()))
+
+    # 跑 unet forward with 真实残差 (实际使用时的 hidden)
+    with torch.no_grad():
+        try:
+            _ = raw_unet(
+                noisy_latents,
+                timesteps,
+                encoder_hidden_states=encoder_hidden_states,
+                down_block_additional_residuals=[
+                    d.to(dtype=weight_dtype) for d in down_res
+                ],
+                mid_block_additional_residual=mid_res.to(dtype=weight_dtype),
+            ).sample
+        except Exception as e:
+            logger.warning(f"[ARCA] UNet baseline forward 失败: {e}")
+            for h in handles: h.remove()
+            return None
+
+    for h in handles: h.remove()
+
+    if len(captured_stds) < 5:
+        return None
+
+    # 5 个 std 映射到 7 个 ARCA stage:
+    #   main_arca[0] -> captured_stds[0]  (down_blocks.0: 320ch, 64x64)
+    #   main_arca[1] -> captured_stds[1]  (down_blocks.1: 640ch, 32x32)
+    #   main_arca[2] -> captured_stds[2]  (down_blocks.2: 1280ch, 16x16)
+    #   main_arca[3] -> captured_stds[3]  (down_blocks.3: 1280ch, 8x8)
+    #   down_arca[0] -> captured_stds[1]  (与 main_arca[1] 同一 down_block)
+    #   down_arca[1] -> captured_stds[2]  (与 main_arca[2] 同一 down_block)
+    #   mid_arca     -> captured_stds[4]  (mid_block: 1280ch, 8x8)
+    unet_stds = [
+        captured_stds[0],  # main_arca.0
+        captured_stds[1],  # main_arca.1
+        captured_stds[2],  # main_arca.2
+        captured_stds[3],  # main_arca.3
+        captured_stds[1],  # down_arca.0
+        captured_stds[2],  # down_arca.1
+        captured_stds[4],  # mid_arca
+    ]
+    return unet_stds
 
 
 def log_validation(vae, text_encoder, tokenizer, unet, controlnet, args, accelerator, weight_dtype, step):
@@ -1591,12 +1705,17 @@ def main(args):
             if args.train_method == "dpo":
                 logs["implicit_acc"] = float(implicit_acc.detach().item())
 
-            # ARCA 监控: 每 N 步打印 7 层 alpha + 残差 std (论文消融图表数据源)
+            # ARCA 监控: 每 N 步打印 7 层 alpha + 残差 std + UNet 残差比 R (论文消融图表数据源)
             if (args.arca_log_interval > 0
                     and global_step > 0
                     and global_step % args.arca_log_interval == 0
                     and accelerator.is_main_process):
-                _log_arca_monitor(controlnet, accelerator, global_step)
+                # 抓 5 个 UNet 关键 hidden 位置的 std (用于 R = res_std/unet_std 监控)
+                unet_stds = _capture_unet_baseline_stds(
+                    accelerator, controlnet, unet, vae, text_encoder,
+                    batch, weight_dtype, noise_scheduler, global_step,
+                )
+                _log_arca_monitor(controlnet, accelerator, global_step, unet_stds=unet_stds)
 
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
