@@ -204,10 +204,13 @@ def _load_controlnet_smart(cn_path: str) -> torch.nn.Module:
         print(f"[load] 使用 vanilla ControlNetModel (class_name={class_name})")
         model = ControlNetModel.from_pretrained(cn_path)
 
-    # 防御: from_pretrained 偶尔会留下 meta device, 强制搬回 cpu
+    # 防御: vanilla ControlNetModel.from_pretrained 可能留下 meta device
+    # 用 named_parameters() 代替 parameters() 避免某些版本 .parameters 被 config 字段 shadow
     try:
-        if any(p.is_meta for p in model.parameters()):
-            print("[load] 检测到 meta device, 触发 to_empty + state_dict 重载")
+        has_meta = any(getattr(p, "is_meta", False)
+                       for _, p in model.named_parameters())
+        if has_meta:
+            print("[load] 检测到 meta device, 触发 to_empty")
             model.to_empty(device="cpu")
     except Exception:
         pass
@@ -229,16 +232,16 @@ def build_pipeline(args_config: dict, device, dtype):
     )
     pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
 
-    # 防御: pipeline 某些子模块可能落在 meta device, 先全部 to_empty 到目标 device
+    # 防御: pipeline 某些子模块可能落在 meta device (load_state_dict_with_low_cpu_mem 用),
+    # 直接 .to() 会触发 NotImplementedError, 此时需要 .to_empty() 跨过 meta
     try:
-        if any(p.is_meta for p in pipeline.parameters()):
-            print("[build_pipeline] pipeline 含 meta 参数, 改用 to_empty")
-            pipeline.to_empty(device=device)
-        else:
-            pipeline = pipeline.to(device)
-    except NotImplementedError as e:
-        print(f"[build_pipeline] .to() 触发 meta tensor 错误 ({e}), 回退到 to_empty")
+        pipeline = pipeline.to(device)
+    except (NotImplementedError, TypeError) as e:
+        print(f"[build_pipeline] .to() 触发错误 ({e}), 回退到 to_empty")
         pipeline.to_empty(device=device)
+        # to_empty 不搬运已有数据, 需要重新设 dtype
+        if dtype != torch.float32:
+            pipeline = pipeline.to(dtype=dtype)
 
     pipeline.set_progress_bar_config(disable=True)
 
