@@ -24,6 +24,7 @@ ControlNet 多天气图像恢复 - 独立评估脚本
 
 import argparse
 import io
+import json
 import os
 import random
 import sys
@@ -51,6 +52,7 @@ from diffusers import (
 from diffusers.utils.import_utils import is_xformers_available
 
 from dataloaders.paired_dataset import DEFAULT_WEATHER_PROMPTS
+from models.weather_restoration_controlnet import WeatherRestorationControlNet
 from ramseesr.utils.metrics import fid as calc_fid, lpips, psnr as calc_psnr, ssim as calc_ssim
 
 
@@ -177,11 +179,47 @@ def resolve_controlnet_path(raw_path: str) -> str:
     return str(p)
 
 
+def _load_controlnet_smart(cn_path: str) -> torch.nn.Module:
+    """
+    根据 <dir>/config.json 的 _class_name 自动选 ControlNet 类加载.
+
+      - "ControlNetModel"             -> diffusers vanilla (读 .bin / .safetensors)
+      - "WeatherRestorationControlNet" -> 项目自定义 (只读 .bin)
+      - 其它/缺省: 走 vanilla
+    """
+    cfg_path = Path(cn_path) / "config.json"
+    class_name = "ControlNetModel"
+    if cfg_path.is_file():
+        try:
+            with io.open(cfg_path, "r", encoding="utf-8") as f:
+                class_name = json.load(f).get("_class_name", "ControlNetModel")
+        except Exception as e:
+            print(f"[load] 解析 config.json 失败: {e}, 默认走 ControlNetModel")
+
+    if class_name == "WeatherRestorationControlNet":
+        print(f"[load] 检测到自定义类 {class_name}, 用 WeatherRestorationControlNet.from_pretrained 加载")
+        cn_path_abs = str(Path(cn_path).resolve())
+        model = WeatherRestorationControlNet.from_pretrained(cn_path_abs)
+    else:
+        print(f"[load] 使用 vanilla ControlNetModel (class_name={class_name})")
+        model = ControlNetModel.from_pretrained(cn_path)
+
+    # 防御: from_pretrained 偶尔会留下 meta device, 强制搬回 cpu
+    try:
+        if any(p.is_meta for p in model.parameters()):
+            print("[load] 检测到 meta device, 触发 to_empty + state_dict 重载")
+            model.to_empty(device="cpu")
+    except Exception:
+        pass
+
+    return model
+
+
 def build_pipeline(args_config: dict, device, dtype):
     """构建推理 pipeline (复用 SD + 训练好的 ControlNet)"""
     cn_path = resolve_controlnet_path(args_config["controlnet_model_path"])
     print(f"[eval] ControlNet 路径: {cn_path}")
-    controlnet = ControlNetModel.from_pretrained(cn_path)
+    controlnet = _load_controlnet_smart(cn_path)
 
     pipeline = StableDiffusionControlNetPipeline.from_pretrained(
         args_config["pretrained_model_name_or_path"],
@@ -190,7 +228,18 @@ def build_pipeline(args_config: dict, device, dtype):
         torch_dtype=dtype,
     )
     pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
-    pipeline = pipeline.to(device)
+
+    # 防御: pipeline 某些子模块可能落在 meta device, 先全部 to_empty 到目标 device
+    try:
+        if any(p.is_meta for p in pipeline.parameters()):
+            print("[build_pipeline] pipeline 含 meta 参数, 改用 to_empty")
+            pipeline.to_empty(device=device)
+        else:
+            pipeline = pipeline.to(device)
+    except NotImplementedError as e:
+        print(f"[build_pipeline] .to() 触发 meta tensor 错误 ({e}), 回退到 to_empty")
+        pipeline.to_empty(device=device)
+
     pipeline.set_progress_bar_config(disable=True)
 
     if args_config.get("enable_xformers_memory_efficient_attention", False):
