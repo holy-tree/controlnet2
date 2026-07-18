@@ -1571,6 +1571,22 @@ def main(args):
                             global_step,
                         )
 
+                    # ===== 按 step 评估 PSNR/SSIM (放在内层循环内, 这样 global_step % N == 0 时才被检查) =====
+                    if (args.run_validation
+                            and args.run_validation_steps > 0
+                            and global_step > 0
+                            and global_step % args.run_validation_steps == 0):
+                        controlnet.eval()
+                        unet.eval()
+                        vae.eval()
+                        run_epoch_validation(
+                            vae, unet, controlnet, text_encoder, tokenizer,
+                            accelerator, weight_dtype, args, epoch, train_dataset
+                        )
+                        controlnet.train()
+                        unet.train()
+                        vae.train()
+
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             if args.train_method == "dpo":
                 logs["implicit_acc"] = float(implicit_acc.detach().item())
@@ -1588,22 +1604,6 @@ def main(args):
             if global_step >= args.max_train_steps:
                 break
 
-        # ===== 按 step 评估 PSNR/SSIM (优先于 epoch 末评估) =====
-        if (args.run_validation
-                and args.run_validation_steps > 0
-                and global_step > 0
-                and global_step % args.run_validation_steps == 0):
-            controlnet.eval()
-            unet.eval()
-            vae.eval()
-            run_epoch_validation(
-                vae, unet, controlnet, text_encoder, tokenizer,
-                accelerator, weight_dtype, args, epoch, train_dataset
-            )
-            controlnet.train()
-            unet.train()
-            vae.train()
-
         # ===== Epoch 结束: 验证 + PSNR/SSIM (按 step 评估开启时跳过, 避免重复) =====
         if (args.run_validation
                 and args.run_validation_steps == 0):
@@ -1617,6 +1617,8 @@ def main(args):
             )
             # 恢复 train 模式
             controlnet.train()
+            unet.train()
+            vae.train()
 
     # Create the pipeline using using the trained modules and save it.
     accelerator.wait_for_everyone()
