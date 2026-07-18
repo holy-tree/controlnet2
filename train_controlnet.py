@@ -602,6 +602,16 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
+        "--run_validation_steps",
+        type=int,
+        default=0,
+        help=(
+            "Run run_epoch_validation (PSNR/SSIM on real LQ/GT) every X steps. "
+            "0 = disable (use epoch-based only). >0 = trigger every X steps regardless of epoch boundary. "
+            "Example: 2000 = evaluate PSNR every 2000 training steps."
+        ),
+    )
+    parser.add_argument(
         "--tracker_project_name",
         type=str,
         default="train_controlnet_SR",
@@ -1578,8 +1588,25 @@ def main(args):
             if global_step >= args.max_train_steps:
                 break
 
-        # ===== Epoch 结束: 验证 + PSNR/SSIM =====
-        if args.run_validation:
+        # ===== 按 step 评估 PSNR/SSIM (优先于 epoch 末评估) =====
+        if (args.run_validation
+                and args.run_validation_steps > 0
+                and global_step > 0
+                and global_step % args.run_validation_steps == 0):
+            controlnet.eval()
+            unet.eval()
+            vae.eval()
+            run_epoch_validation(
+                vae, unet, controlnet, text_encoder, tokenizer,
+                accelerator, weight_dtype, args, epoch, train_dataset
+            )
+            controlnet.train()
+            unet.train()
+            vae.train()
+
+        # ===== Epoch 结束: 验证 + PSNR/SSIM (按 step 评估开启时跳过, 避免重复) =====
+        if (args.run_validation
+                and args.run_validation_steps == 0):
             # 确保 controlnet / unet / vae 处于 eval 模式
             controlnet.eval()
             unet.eval()
