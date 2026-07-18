@@ -759,6 +759,10 @@ def parse_args(input_args=None):
         help="可选: 在 DPO 损失上叠加 GT 监督 MSE 损失, 防止 reward hacking",
     )
     parser.add_argument(
+        "--latent_l1_weight", type=float, default=0.2,
+        help="SFT 阶段在 noise MSE 上叠加 latent L1 重建损失, 给模型像素/隐空间内容锚定 (建议 0.05~0.3, 0=关闭)",
+    )
+    parser.add_argument(
         "--candidates_subdir", type=str, default="candidates",
         help="build_preference.py 写出的候选子目录名",
     )
@@ -1624,8 +1628,24 @@ def main(args):
                     else:
                         loss = loss_dpo
                 else:
-                    # ---------- SFT 损失 (沿用原版) ----------
-                    loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    # ---------- SFT 损失: noise MSE + latent L1 ----------
+                    # noise MSE: 原有扩散损失, 约束轨迹
+                    loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+
+                    # latent L1: 从 noise 预测还原 x0, 在隐空间与 GT 对齐,
+                    # 弥补 noise MSE 不约束最终 RGB 的缺陷, 直接缓解色彩/纹理漂移
+                    loss_l1 = torch.tensor(0.0, device=model_pred.device)
+                    if args.latent_l1_weight > 0.0:
+                        alphas_cumprod = noise_scheduler.alphas_cumprod.to(model_pred.device)
+                        alpha_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1).float()
+                        sqrt_alpha = alpha_t.sqrt()
+                        sqrt_one_minus_alpha = (1.0 - alpha_t).sqrt()
+                        # x_t = sqrt(a)*x0 + sqrt(1-a)*eps  =>  x0 = (x_t - sqrt(1-a)*eps) / sqrt(a)
+                        pred_x0 = (noisy_latents.float() - sqrt_one_minus_alpha * model_pred.float()) / sqrt_alpha
+                        pred_x0 = pred_x0.clamp(-3.0, 3.0)
+                        loss_l1 = F.l1_loss(pred_x0, latents.float(), reduction="mean")
+
+                    loss = loss_mse + args.latent_l1_weight * loss_l1
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1704,6 +1724,10 @@ def main(args):
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             if args.train_method == "dpo":
                 logs["implicit_acc"] = float(implicit_acc.detach().item())
+            else:
+                if args.latent_l1_weight > 0.0:
+                    logs["loss_mse"] = loss_mse.detach().item()
+                    logs["loss_l1"] = loss_l1.detach().item()
 
             # ARCA 监控: 每 N 步打印 7 层 alpha + 残差 std + UNet 残差比 R (论文消融图表数据源)
             if (args.arca_log_interval > 0
