@@ -759,8 +759,20 @@ def parse_args(input_args=None):
         help="可选: 在 DPO 损失上叠加 GT 监督 MSE 损失, 防止 reward hacking",
     )
     parser.add_argument(
-        "--latent_l1_weight", type=float, default=0.2,
+        "--latent_l1_weight", type=float, default=0.1,
         help="SFT 阶段在 noise MSE 上叠加 latent L1 重建损失, 给模型像素/隐空间内容锚定 (建议 0.05~0.3, 0=关闭)",
+    )
+    parser.add_argument(
+        "--lpips_weight", type=float, default=0.05,
+        help="SFT 阶段叠加 LPIPS 感知损失权重 (修复高频纹理/细节, 建议 0.03~0.1, 0=关闭)",
+    )
+    parser.add_argument(
+        "--lpips_interval", type=int, default=4,
+        help="每隔 N 步算一次 LPIPS, 其余步置 0, 降低 VAE 解码开销",
+    )
+    parser.add_argument(
+        "--lpips_net", type=str, default="alex", choices=["alex", "vgg"],
+        help="LPIPS backbone: alex (快) 或 vgg (准)",
     )
     parser.add_argument(
         "--candidates_subdir", type=str, default="candidates",
@@ -1419,6 +1431,21 @@ def main(args):
     if ref_controlnet is not None:
         ref_controlnet.to(accelerator.device, dtype=weight_dtype)
 
+    # ==================== LPIPS 感知损失模型加载 (SFT 阶段使用) ====================
+    # LPIPS 保持 fp32, 避免 fp16 数值不稳; 一次加载复用
+    lpips_model = None
+    if args.lpips_weight > 0.0:
+        try:
+            import lpips as lpips_pkg
+            lpips_model = lpips_pkg.LPIPS(net=args.lpips_net, verbose=False).to(accelerator.device)
+            lpips_model.eval()
+            for p in lpips_model.parameters():
+                p.requires_grad_(False)
+            logger.info(f"[LPIPS] 加载完成: net={args.lpips_net}, weight={args.lpips_weight}, interval={args.lpips_interval}")
+        except Exception as e:
+            logger.warning(f"[LPIPS] 加载失败 ({e}), 已关闭感知损失")
+            lpips_model = None
+
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -1628,13 +1655,14 @@ def main(args):
                     else:
                         loss = loss_dpo
                 else:
-                    # ---------- SFT 损失: noise MSE + latent L1 ----------
+                    # ---------- SFT 损失: noise MSE + latent L1 + LPIPS ----------
                     # noise MSE: 原有扩散损失, 约束轨迹
                     loss_mse = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
 
                     # latent L1: 从 noise 预测还原 x0, 在隐空间与 GT 对齐,
                     # 弥补 noise MSE 不约束最终 RGB 的缺陷, 直接缓解色彩/纹理漂移
                     loss_l1 = torch.tensor(0.0, device=model_pred.device)
+                    pred_x0 = None
                     if args.latent_l1_weight > 0.0:
                         alphas_cumprod = noise_scheduler.alphas_cumprod.to(model_pred.device)
                         alpha_t = alphas_cumprod[timesteps].view(-1, 1, 1, 1).float()
@@ -1646,6 +1674,30 @@ def main(args):
                         loss_l1 = F.l1_loss(pred_x0, latents.float(), reduction="mean")
 
                     loss = loss_mse + args.latent_l1_weight * loss_l1
+
+                    # LPIPS 感知损失: 每 N 步算一次, 解码 pred_x0/latents 到 RGB,
+                    # 在感知特征空间对齐 GT, 修复高频纹理/细节.
+                    # VAE.decode 不参与梯度回传到这里 (用 pred_x0 反传),
+                    # 仍受 fp16 数值影响, 所以反传时转 fp32 再 clamp.
+                    loss_lpips = torch.tensor(0.0, device=model_pred.device)
+                    if (lpips_model is not None
+                            and args.lpips_weight > 0.0
+                            and pred_x0 is not None
+                            and (global_step % args.lpips_interval == 0)):
+                        try:
+                            with torch.no_grad():
+                                # decode 走 no_grad 避免 VAE 内部存大 activation map
+                                scaling = vae.config.scaling_factor
+                                pred_rgb = vae.decode(pred_x0.to(weight_dtype) / scaling).sample.float().clamp(-1, 1)
+                                gt_rgb = vae.decode(latents.to(weight_dtype) / scaling).sample.float().clamp(-1, 1)
+                            # LPIPS 内部已经把 [-1, 1] 映射到感知空间
+                            d = lpips_model(pred_rgb, gt_rgb)
+                            loss_lpips = d.mean()
+                        except Exception as e:
+                            logger.warning(f"[LPIPS] 计算失败 ({e}), 跳过本步")
+                            loss_lpips = torch.tensor(0.0, device=model_pred.device)
+
+                    loss = loss + args.lpips_weight * loss_lpips
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1728,6 +1780,8 @@ def main(args):
                 if args.latent_l1_weight > 0.0:
                     logs["loss_mse"] = loss_mse.detach().item()
                     logs["loss_l1"] = loss_l1.detach().item()
+                if args.lpips_weight > 0.0:
+                    logs["loss_lpips"] = loss_lpips.detach().item()
 
             # ARCA 监控: 每 N 步打印 7 层 alpha + 残差 std + UNet 残差比 R (论文消融图表数据源)
             if (args.arca_log_interval > 0
