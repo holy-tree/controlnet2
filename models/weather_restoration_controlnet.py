@@ -352,16 +352,18 @@ class WeatherRestorationControlNet(ControlNetModel):
         # feats[3] F8 : (B, 1280, H/64, W/64)
 
         # ---- 2. 四级 TimedC2F + ARCA, 产出 4 个主残差 (已是 zero_conv + alpha 校准后) ----
-        # 4 个主 stage 各自吃 c2f 输出, 各自有独立 zero_conv + alpha
-        r_F64 = self.main_arca[0](feats[0])   # 320ch, 64x64
-        r_F32 = self.main_arca[1](feats[1])   # 640ch, 32x32
-        r_F16 = self.main_arca[2](feats[2])   # 1280ch, 16x16
-        r_F8  = self.main_arca[3](feats[3])   # 1280ch, 8x8
+        # 第一步: 4 个 TimedC2F 块处理 feats (雨/雪/雾特征精炼, 含粗细分支 + 时序调制)
+        c2f_out = [self.timed_c2f_blocks[i](feats[i], timestep) for i in range(4)]
+        # 第二步: 4 个主 stage 各自吃 c2f 输出, 各自有独立 zero_conv + alpha
+        r_F64 = self.main_arca[0](c2f_out[0])   # 320ch, 64x64
+        r_F32 = self.main_arca[1](c2f_out[1])   # 640ch, 32x32
+        r_F16 = self.main_arca[2](c2f_out[2])   # 1280ch, 16x16
+        r_F8  = self.main_arca[3](c2f_out[3])   # 1280ch, 8x8
         # 2 downsample 位置 (channel projection) - 各自 ARCA, 直接吃 c2f 输出
-        r_down_0 = self.down_arca[0](feats[1])  # 320ch, 32x32 (from F32)
-        r_down_1 = self.down_arca[1](feats[2])  # 640ch, 16x16 (from F16)
+        r_down_0 = self.down_arca[0](c2f_out[1])  # 320ch, 32x32 (from F32)
+        r_down_1 = self.down_arca[1](c2f_out[2])  # 640ch, 16x16 (from F16)
         # mid - 独立 ARCA, 直接吃 c2f 输出
-        r_mid = self.mid_arca(feats[3])         # 1280ch, 8x8
+        r_mid = self.mid_arca(c2f_out[3])         # 1280ch, 8x8
 
         # ---- 4. 拼装 12 down_res + 1 mid_res, 顺序严格匹配 SD2 UNet ----
         # [pos 0..2]: F64 × 3
