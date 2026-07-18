@@ -118,8 +118,58 @@ class WeatherRestorationControlNet(ControlNetModel):
         # 1 个 mid
         self.mid_arca = ARCAResidualCalibrator(1280, 1280)
 
+        # ---- 4. config (供 pipeline / save_pretrained 读取) ----
+        # 通过 register_to_config 注入 config (ConfigMixin 标准做法),
+        # 避免 self.config = ... 触发 ConfigMixin 的 read-only property 错误.
+        from diffusers.configuration_utils import FrozenDict
+        self._internal_dict = FrozenDict({
+            "in_channels": in_channels,
+            "cross_attention_dim": cross_attention_dim,
+            "block_out_channels": tuple(block_out_channels),
+            "conditioning_channels": conditioning_channels,
+            # 下面这些字段是 pipeline / save_pretrained 可能读到的占位字段
+            "down_block_types": ("CrossAttnDownBlock2D", "CrossAttnDownBlock2D",
+                                  "CrossAttnDownBlock2D", "DownBlock2D"),
+            "sample_size": None,
+            "transformer_layers_per_block": 1,
+            "attention_head_dim": 8,
+            "num_attention_heads": None,
+            "use_linear_projection": False,
+            "class_embed_type": None,
+            "num_class_embeds": None,
+            "upcast_attention": False,
+            "resnet_time_scale_shift": "default",
+            "projection_class_embeddings_input_dim": None,
+            "mid_block_type": "UNetMidBlock2DCrossAttn",
+            "controlnet_conditioning_channel_order": "rgb",
+            "conditioning_embedding_out_channels": (16, 32, 96, 256),
+            "global_pool_conditions": False,
+            "encoder_hid_dim": None,
+            "encoder_hid_dim_type": None,
+            "addition_embed_type": None,
+            "addition_time_embed_dim": None,
+            "act_fn": "silu",
+            "norm_num_groups": 32,
+            "norm_eps": 1e-5,
+            "downsample_padding": 1,
+            "mid_block_scale_factor": 1.0,
+            "only_cross_attention": False,
+            "loading_state_dict": False,
+            "_class_name": "WeatherRestorationControlNet",
+            "_diffusers_version": "0.25.0",
+        })
+
         # 注意: 不要手动设置 self.dtype, ControlNetModel 继承自 ModelMixin,
         #       dtype 是 property, 动态从参数 dtype 取值.
+
+    # ------------------------------------------------------------------------
+    # 类级 property: .config 返回 _internal_dict, 让 diffusers pipeline
+    # 的 controlnet.config.X 访问链路 (如 controlnet.config.global_pool_conditions)
+    # 在 skip __init__ 后仍能工作.
+    # ------------------------------------------------------------------------
+    @property
+    def config(self):  # type: ignore[override]
+        return self._internal_dict
 
     # ------------------------------------------------------------------------
     # 类级 property: 把 7 个 zero_conv 通过统一命名暴露, 兼容旧代码 / 诊断脚本.
@@ -168,47 +218,6 @@ class WeatherRestorationControlNet(ControlNetModel):
         if hasattr(self, "mid_arca"):
             return self.mid_arca.zero_conv
         return self.__dict__["zero_conv_mid"]
-
-        # ---- 4. config (供 pipeline / save_pretrained 读取) ----
-        # 通过 register_to_config 注入 config (ConfigMixin 标准做法),
-        # 避免 self.config = ... 触发 ConfigMixin 的 read-only property 错误.
-        from diffusers.configuration_utils import FrozenDict
-        self._internal_dict = FrozenDict({
-            "in_channels": in_channels,
-            "cross_attention_dim": cross_attention_dim,
-            "block_out_channels": tuple(block_out_channels),
-            "conditioning_channels": conditioning_channels,
-            # 下面这些字段是 pipeline / save_pretrained 可能读到的占位字段
-            "down_block_types": ("CrossAttnDownBlock2D", "CrossAttnDownBlock2D",
-                                  "CrossAttnDownBlock2D", "DownBlock2D"),
-            "sample_size": None,
-            "transformer_layers_per_block": 1,
-            "attention_head_dim": 8,
-            "num_attention_heads": None,
-            "use_linear_projection": False,
-            "class_embed_type": None,
-            "num_class_embeds": None,
-            "upcast_attention": False,
-            "resnet_time_scale_shift": "default",
-            "projection_class_embeddings_input_dim": None,
-            "mid_block_type": "UNetMidBlock2DCrossAttn",
-            "controlnet_conditioning_channel_order": "rgb",
-            "conditioning_embedding_out_channels": (16, 32, 96, 256),
-            "global_pool_conditions": False,
-            "encoder_hid_dim": None,
-            "encoder_hid_dim_type": None,
-            "addition_embed_type": None,
-            "addition_time_embed_dim": None,
-            "act_fn": "silu",
-            "norm_num_groups": 32,
-            "norm_eps": 1e-5,
-            "downsample_padding": 1,
-            "mid_block_scale_factor": 1.0,
-            "only_cross_attention": False,
-            "loading_state_dict": False,
-            "_class_name": "WeatherRestorationControlNet",
-            "_diffusers_version": "0.25.0",
-        })
 
     def __getattr__(self, name: str):
         """防御性兜底: pipeline 可能在不同版本中访问 self.X 上不存在的字段.
