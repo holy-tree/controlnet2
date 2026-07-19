@@ -68,6 +68,15 @@ class WeatherDegradationEncoder(nn.Module):
         self.proj_128 = nn.Conv2d(stem_channels, 320, 1)
         nn.init.zeros_(self.proj_128.weight)
         nn.init.zeros_(self.proj_128.bias)
+        # Phase 4.1: 可学习下采样 (取代纯 bilinear)
+        # 原因: bilinear 下采样相当于 4×4 均值滤波, 把 F128 的高频信息彻底磨平
+        # 改成 Upsample(0.5) + Conv2d, conv 可以学"找回"边缘细节
+        # 同样 init=0 保证训练初期 f128 贡献仍为 0
+        self.f128_refine = nn.Sequential(
+            nn.Upsample(scale_factor=0.5, mode='bilinear', align_corners=False),
+            nn.Conv2d(320, 320, 3, padding=1, bias=False),
+        )
+        nn.init.zeros_(self.f128_refine[1].weight)
         self.proj_32 = nn.Conv2d(320, 640, 1)
         self.proj_16 = nn.Conv2d(640, 1280, 1)
         self.proj_8 = nn.Conv2d(1280, 1280, 1)
@@ -96,8 +105,9 @@ class WeatherDegradationEncoder(nn.Module):
         # F128 → 320ch, 上采样到 64x64, 加到 F64 (高频细节注入)
         f128 = self.proj_128(feat_128)                 # [B, 320, H/4, W/4]
         f64_base = self.proj_64(feat_64_base)         # [B, 320, H/8, W/8]
-        f128_up = F.interpolate(f128, size=f64_base.shape[-2:],
-                                mode='bilinear', align_corners=False)
+        # Phase 4.1: 可学习上采样 (Upsample + Conv) 取代纯 bilinear
+        # 避免 4×4 均值滤波磨平高频
+        f128_up = self.f128_refine(f128)               # [B, 320, H/8, W/8]
         f64 = f64_base + f128_up                       # [B, 320, H/8, W/8]
 
         f32 = self.proj_32(F.avg_pool2d(f64, 2))      # [B, 640, H/16, W/16]

@@ -56,6 +56,87 @@ from diffusers.optimization import get_scheduler
 from diffusers.utils import check_min_version, is_wandb_available
 from diffusers.utils.import_utils import is_xformers_available
 
+import math
+import re
+
+
+# ============================================================
+# LoRA (Low-Rank Adaptation) 手动实现 - 不依赖 peft 库
+# ============================================================
+class LoRALinear(nn.Module):
+    """LoRA wrapper for nn.Linear.
+
+    数学: y = W @ x + (B @ A) @ x * scaling
+    其中 W 是冻结的原权重, A (rank x in) 和 B (out x rank) 是 trainable.
+    init: A = Kaiming uniform, B = zeros → 初始 LoRA 输出 = 0, 不破坏原模型.
+    """
+
+    def __init__(self, original_linear: nn.Linear, rank: int = 16, alpha: int = 32,
+                 lora_dropout: float = 0.0):
+        super().__init__()
+        self.original = original_linear
+        # 冻结原权重 (Phase 4: UNet 主体保持冻结, 仅 LoRA 训练)
+        self.original.weight.requires_grad_(False)
+        if self.original.bias is not None:
+            self.original.bias.requires_grad_(False)
+
+        in_features = original_linear.in_features
+        out_features = original_linear.out_features
+
+        # LoRA 矩阵 (A 随机, B 零)
+        self.lora_A = nn.Parameter(torch.empty(rank, in_features))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        self.scaling = alpha / rank
+        self.lora_dropout = nn.Dropout(lora_dropout) if lora_dropout > 0 else nn.Identity()
+
+        # Init: A = kaiming, B = 0 → lora_delta 初始为 0
+        nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
+
+    def forward(self, x):
+        original_out = self.original(x)
+        # LoRA delta: x @ A^T @ B^T * scaling
+        lora_delta = (self.lora_dropout(x) @ self.lora_A.T) @ self.lora_B.T * self.scaling
+        return original_out + lora_delta
+
+
+def apply_lora_to_unet(unet, rank: int = 16, alpha: int = 32,
+                       target_module_names: list = None,
+                       lora_dropout: float = 0.0):
+    """把 UNet 中指定名称的 nn.Linear 替换为 LoRALinear.
+
+    target_module_names: 要包装的模块短名, 默认 ['to_q', 'to_v', 'to_k', 'to_out.0']
+                        覆盖 SD2 UNet 的 self-attn 和 cross-attn 的 Q/K/V/output 投影.
+    返回: (包装的模块数, 新增的 trainable 参数数)
+    """
+    if target_module_names is None:
+        target_module_names = ['to_q', 'to_v', 'to_k']
+
+    wrapped_count = 0
+    new_trainable_params = 0
+    # 按名字找到目标模块并替换
+    for name, module in unet.named_modules():
+        if not isinstance(module, nn.Linear):
+            continue
+        # name 是类似 "down_blocks.0.attentions.0.transformer_blocks.0.attn1.to_q"
+        # 取最后一段判断是否要包装
+        short_name = name.split('.')[-1]
+        if short_name not in target_module_names:
+            continue
+        # 找 parent module
+        parent = unet
+        parts = name.split('.')
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        attr_name = parts[-1]
+        # 替换为 LoRA wrapper
+        lora_mod = LoRALinear(module, rank=rank, alpha=alpha, lora_dropout=lora_dropout)
+        setattr(parent, attr_name, lora_mod)
+        wrapped_count += 1
+        # 统计新增 trainable
+        new_trainable_params += lora_mod.lora_A.numel() + lora_mod.lora_B.numel()
+
+    return wrapped_count, new_trainable_params
+
 from dataloaders.paired_dataset import PairedCaptionDataset
 from dataloaders.dpo_preference_dataset import (
     DPOPreferenceDataset,
@@ -565,6 +646,16 @@ def parse_args(input_args=None):
                              "需较高 LR 让 gate 从 1.0 降到目标值 0.3~0.5).")
     parser.add_argument("--gate_weight_decay", type=float, default=0.0,
                         help="ARCA gate 的 weight_decay (默认 0, 让 gate 可自由降到 < 1).")
+    parser.add_argument("--use_unet_lora", action="store_true",
+                        help="是否给 UNet attention 加 LoRA (Phase 5, +2~4 dB 预期). 默认关闭, 需要显式启用.")
+    parser.add_argument("--lora_rank", type=int, default=16,
+                        help="LoRA rank (默认 16, 典型 8/16/32).")
+    parser.add_argument("--lora_alpha", type=int, default=32,
+                        help="LoRA alpha (通常 = 2*rank).")
+    parser.add_argument("--lora_dropout", type=float, default=0.0,
+                        help="LoRA dropout (默认 0, 不用 dropout).")
+    parser.add_argument("--lora_target_modules", type=str, default="to_q,to_v",
+                        help="要加 LoRA 的模块名 (逗号分隔), 默认 'to_q,to_v' (Q/V 投影).")
     parser.add_argument("--arca_log_interval", type=int, default=500,
                         help="每 N 步打印一次 7 层 alpha + 残差 std 监控表.")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
@@ -774,6 +865,11 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--lpips_interval", type=int, default=4,
         help="每隔 N 步算一次 LPIPS, 其余步置 0, 降低 VAE 解码开销",
+    )
+    parser.add_argument(
+        "--freq_loss_weight", type=float, default=0.1,
+        help="SFT 阶段叠加 FFT 频域 L1 损失, 保留高频细节 (雨丝/雪粒), "
+             "建议 0.05~0.2, 0=关闭",
     )
     parser.add_argument(
         "--lpips_net", type=str, default="alex", choices=["alex", "vgg"],
@@ -1216,6 +1312,24 @@ def main(args):
     text_encoder.requires_grad_(False)
     controlnet.train()
 
+    # === Phase 5: UNet LoRA (大幅突破 SD2 的 restoration 上限, 预期 +2~4 dB)
+    #     LoRA 在 attention 的 Q/V (或 Q/K/V) 投影上加低秩适配, 训练量小 (~20M),
+    #     SD2 UNet 主体保持冻结, 只有 LoRA 矩阵 (A, B) 训练.
+    if args.use_unet_lora:
+        target_module_names = [s.strip() for s in args.lora_target_modules.split(",") if s.strip()]
+        n_wrapped, n_params = apply_lora_to_unet(
+            unet,
+            rank=args.lora_rank,
+            alpha=args.lora_alpha,
+            target_module_names=target_module_names,
+            lora_dropout=args.lora_dropout,
+        )
+        logger.info(
+            f"[Phase 5: LoRA] 包装了 {n_wrapped} 个 Linear 层 "
+            f"(target={target_module_names}, rank={args.lora_rank}, alpha={args.lora_alpha}), "
+            f"新增 trainable 参数 {n_params:,}"
+        )
+
     # ## init the RAM or DAPE model
     # from ram.models.ram_lora import ram
     # from ram import get_transform
@@ -1287,7 +1401,8 @@ def main(args):
     # ARCA-aware 分组: 7 个 stage_alpha 用单独小 lr (--arca_lr),
     # 7 个 stage_gate 用单独高 lr (--gate_lr, 直接乘子需要快速学习),
     # 其余 controlnet 参数 (含 7 个 zero_conv + DWConv/PWConv/LN + 编码器) 用 --learning_rate.
-    alpha_params, gate_params, other_params = [], [], []
+    # Phase 5 LoRA: 从 UNet 中收集 LoRA 参数 (lora_A, lora_B), 用主学习率
+    alpha_params, gate_params, other_params, lora_params = [], [], [], []
     for name, p in controlnet.named_parameters():
         if not p.requires_grad:
             continue
@@ -1297,6 +1412,19 @@ def main(args):
             gate_params.append(p)
         else:
             other_params.append(p)
+
+    # Phase 5: 收集 UNet LoRA 参数
+    if args.use_unet_lora:
+        for name, p in unet.named_parameters():
+            if not p.requires_grad:
+                continue
+            # LoRA 参数 (lora_A, lora_B) 在 LoRALinear wrapper 里, 名字含 lora_A / lora_B
+            if "lora_A" in name or "lora_B" in name:
+                lora_params.append(p)
+        if lora_params:
+            print(f"[Phase 5: LoRA] 检测到 {len(lora_params)} 个 UNet LoRA 参数, "
+                  f"lr={args.learning_rate}")
+
     if alpha_params:
         print(f"[ARCA] 检测到 {len(alpha_params)} 个 stage_alpha 参数, "
               f"lr={args.arca_lr}, weight_decay={args.arca_alpha_weight_decay}")
@@ -1307,6 +1435,12 @@ def main(args):
         {"params": other_params, "lr": args.learning_rate,
          "weight_decay": args.adam_weight_decay},
     ]
+    if lora_params:
+        param_groups.append({
+            "params": lora_params, "lr": args.learning_rate,
+            "weight_decay": args.adam_weight_decay,
+            "name": "unet_lora",
+        })
     if alpha_params:
         param_groups.append({
             "params": alpha_params, "lr": args.arca_lr,
@@ -1638,14 +1772,17 @@ def main(args):
                 #     训练过程中 proj_128 慢慢学到非零权重, F128 贡献逐渐出现
                 proj_reset_count = 0
                 for n, p in controlnet.named_parameters():
-                    if n.endswith("proj_128.weight") or n.endswith("proj_128.bias"):
+                    # Phase 4.1: 同时重置 proj_128 和 f128_refine (上采样 conv)
+                    if (n.endswith("proj_128.weight")
+                            or n.endswith("proj_128.bias")
+                            or n.endswith("f128_refine.1.weight")):
                         if p.data.abs().max() > 1e-6:
                             p.data.zero_()
                             proj_reset_count += 1
                 if proj_reset_count > 0:
                     accelerator.print(
-                        f"[patch] 重置 proj_128 权重为 0 "
-                        f"(避免随机权重污染 F64, F128 注入从零开始)"
+                        f"[patch] 重置 {proj_reset_count} 个 F128 相关权重为 0 "
+                        f"(proj_128 + f128_refine, 避免随机权重污染 F64)"
                     )
 
             global_step = int(path.split("-")[1])
@@ -1814,6 +1951,18 @@ def main(args):
 
                     loss = loss_mse + args.latent_l1_weight * loss_l1
 
+                    # Frequency (FFT) loss: 在隐空间频域对齐, 保留高频细节
+                    # (雨丝/雪粒). 与 latent L1 互补, L1 保幅值, FFT 保频谱.
+                    loss_freq = torch.tensor(0.0, device=model_pred.device)
+                    if args.freq_loss_weight > 0.0 and pred_x0 is not None:
+                        # rfft2: 实数输入 → 复数输出, 形状 [B, C, H, W//2+1]
+                        # 取幅值 (相位信息对内容重建帮助小, 幅值更稳定)
+                        pred_fft = torch.fft.rfft2(pred_x0, norm="ortho")
+                        tgt_fft = torch.fft.rfft2(latents.float(), norm="ortho")
+                        loss_freq = F.l1_loss(pred_fft.abs(), tgt_fft.abs(), reduction="mean")
+
+                    loss = loss + args.freq_loss_weight * loss_freq
+
                     # LPIPS 感知损失: 每 N 步算一次, 解码 pred_x0/latents 到 RGB,
                     # 在感知特征空间对齐 GT, 修复高频纹理/细节.
                     # VAE.decode 不参与梯度回传到这里 (用 pred_x0 反传),
@@ -1919,6 +2068,8 @@ def main(args):
                 if args.latent_l1_weight > 0.0:
                     logs["loss_mse"] = loss_mse.detach().item()
                     logs["loss_l1"] = loss_l1.detach().item()
+                if args.freq_loss_weight > 0.0:
+                    logs["loss_freq"] = loss_freq.detach().item()
                 if args.lpips_weight > 0.0:
                     logs["loss_lpips"] = loss_lpips.detach().item()
 
