@@ -1680,6 +1680,13 @@ def main(args):
                 if not sched_backup.exists():
                     shutil.copy2(scheduler_bin, sched_backup)
                     accelerator.print(f"[patch] 备份 scheduler → {sched_backup.name}")
+                # 删除 scheduler.bin: 避免老 cosine state 加载到新 constant scheduler
+                # (lambda(last_epoch) 会给出错误的 LR). 新 scheduler 从 base_lr=5e-5 开始.
+                scheduler_bin.unlink()
+                accelerator.print(
+                    "[patch] 已删除 scheduler.bin (新 scheduler 从 base_lr 开始, "
+                    "避免老 state 类型不兼容)"
+                )
 
             opt_bin = full_ckpt_path_obj / "optimizer.bin"
             if opt_bin.exists():
@@ -1696,60 +1703,23 @@ def main(args):
             try:
                 accelerator.load_state(full_ckpt_path)
             except FileNotFoundError as e:
-                # optimizer.bin 已删, accelerate 跳过 optimizer 加载, 这里吃掉 FileNotFoundError
-                if "optimizer" in str(e).lower():
-                    accelerator.print(f"[patch] 跳过 optimizer 加载: {e}")
+                # optimizer.bin / scheduler.bin 已删, accelerate 跳过加载, 这里吃掉 FileNotFoundError
+                err_msg = str(e).lower()
+                if "optimizer" in err_msg or "scheduler" in err_msg:
+                    accelerator.print(f"[patch] 跳过缺失文件: {e}")
                 else:
                     raise
 
-            # 手动恢复 scheduler.bin (load_state 在 optimizer 失败后中断, scheduler 没被加载)
-            if scheduler_bin.exists():
-                try:
-                    sched_state = torch.load(scheduler_bin, map_location="cpu")
-                    lr_scheduler.load_state_dict(sched_state)
-
-                    # === Patch: 修复 lr_lambdas 与 base_lrs 长度不一致
-                    #     lr_scheduler 是 AcceleratedScheduler 包装层, 真正的 PyTorch LambdaLR
-                    #     在 lr_scheduler.scheduler 上. 老 state_dict 里的 base_lrs 长度是
-                    #     旧 param group 数 (无 gate = 2), 当前是 3 (有 gate), 导致 zip 失败.
-                    underlying = lr_scheduler
-                    # 如果是 accelerate 包装的, 找底层 PyTorch LambdaLR
-                    if hasattr(lr_scheduler, "scheduler"):
-                        cand = lr_scheduler.scheduler
-                        if hasattr(cand, "lr_lambdas"):
-                            underlying = cand
-
-                    if hasattr(underlying, "lr_lambdas") and hasattr(underlying, "base_lrs"):
-                        n_lambda = len(underlying.lr_lambdas)
-                        n_base = len(underlying.base_lrs)
-                        n_target = len(underlying.optimizer.param_groups)
-                        if n_base != n_target or n_lambda != n_target:
-                            accelerator.print(
-                                f"[patch] 同步 base_lrs/lr_lambdas: "
-                                f"lr_lambdas={n_lambda}, base_lrs={n_base}, "
-                                f"optimizer.param_groups={n_target}"
-                            )
-                            # 从当前 optimizer 取 base_lrs (覆盖老 state 值)
-                            underlying.base_lrs = [
-                                g["lr"] for g in underlying.optimizer.param_groups
-                            ]
-                            # 扩展或截断 lr_lambdas 到一致长度
-                            underlying.lr_lambdas = list(underlying.lr_lambdas)
-                            while len(underlying.lr_lambdas) < n_target:
-                                underlying.lr_lambdas.append(underlying.lr_lambdas[0])
-                            underlying.lr_lambdas = underlying.lr_lambdas[:n_target]
-
-                    # 验证: get_last_lr() 应该返回接近原来 1e-5 的 LR
-                    last_lrs = lr_scheduler.get_last_lr()
-                    accelerator.print(
-                        f"[patch] 已恢复 scheduler.bin, LR = {last_lrs[0]:.2e} "
-                        f"(避免 LR 从 schedule 起点重置)"
-                    )
-                except Exception as e:
-                    accelerator.print(f"[patch] scheduler 恢复失败: {e}, LR 将从 schedule 起点重新开始")
+            # 不再手动恢复 scheduler.bin: 它已被删除, 新的 scheduler (constant) 从 base_lr 开始
+            # 打印 LR 验证
+            last_lrs = lr_scheduler.get_last_lr()
+            accelerator.print(
+                f"[patch] 新 scheduler 启动 LR = {last_lrs[0]:.2e} "
+                f"(constant schedule, 不会衰减)"
+            )
 
             # === Patch: 把所有 gate 重置为 1.0 (直接乘子等价于无 gate)
-            #     因为 checkpoint-140000 里的 gate 是 4.0 (旧 sigmoid init) 或 1.0 (上次重置)
+            #     因为 checkpoint 里的 gate 可能不是 1.0 (旧 sigmoid init 或上次错误值),
             #     新代码用直接乘子, gate=4.0 会让 residual 放 4x (破坏模型),
             #     所以必须重置到 1.0 才能保证初始行为与无 gate 一致.
             with torch.no_grad():
@@ -1974,6 +1944,8 @@ def main(args):
                             and pred_x0 is not None
                             and (global_step % args.lpips_interval == 0)):
                         try:
+                            # 清碎片, 给 LPIPS+VAE 解码留显存 (LoRA 已占不少)
+                            torch.cuda.empty_cache()
                             with torch.no_grad():
                                 # decode 走 no_grad 避免 VAE 内部存大 activation map
                                 scaling = vae.config.scaling_factor
