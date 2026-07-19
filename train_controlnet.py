@@ -1509,17 +1509,29 @@ def main(args):
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
             full_ckpt_path = os.path.join(args.output_dir, path)
+            full_ckpt_path_obj = Path(full_ckpt_path)
 
             # === Patch: 当模型新增参数 (如 ARCA gate) 时, 旧 optimizer state 大小不匹配
             #     会报 "parameter group that doesn't match the size of optimizer's group".
-            #     处理方案: 删除 optimizer.bin, 让 accelerate 跳过 optimizer 加载,
-            #     Adam momentum/variance 重新初始化 (代价可控, LR scheduler 状态保留).
-            opt_bin = Path(full_ckpt_path) / "optimizer.bin"
+            #     处理方案:
+            #       1) 备份 scheduler.bin (LR 状态很重要, 必须保留)
+            #       2) 删除 optimizer.bin (让 load_state 不抛 "group size" 错误)
+            #       3) load_state 会因缺失 optimizer 抛 FileNotFoundError, 接住
+            #       4) 手动恢复 scheduler.bin (避免 LR 从 schedule 起点重置!)
+            #     scaler.pt 和 random_states 没恢复 (前 1k step 内可自校正)
+            scheduler_bin = full_ckpt_path_obj / "scheduler.bin"
+            if scheduler_bin.exists():
+                sched_backup = full_ckpt_path_obj / "scheduler.bin.bak"
+                if not sched_backup.exists():
+                    shutil.copy2(scheduler_bin, sched_backup)
+                    accelerator.print(f"[patch] 备份 scheduler → {sched_backup.name}")
+
+            opt_bin = full_ckpt_path_obj / "optimizer.bin"
             if opt_bin.exists():
-                backup = Path(full_ckpt_path) / "optimizer.bin.bak"
-                if not backup.exists():
-                    shutil.copy2(opt_bin, backup)
-                    accelerator.print(f"[patch] 备份旧 optimizer → {backup.name}")
+                opt_backup = full_ckpt_path_obj / "optimizer.bin.bak"
+                if not opt_backup.exists():
+                    shutil.copy2(opt_bin, opt_backup)
+                    accelerator.print(f"[patch] 备份 optimizer → {opt_backup.name}")
                 opt_bin.unlink()
                 accelerator.print(
                     "[patch] 已删除 optimizer.bin (新参数 gate 不兼容旧 Adam state, "
@@ -1534,6 +1546,21 @@ def main(args):
                     accelerator.print(f"[patch] 跳过 optimizer 加载: {e}")
                 else:
                     raise
+
+            # 手动恢复 scheduler.bin (load_state 在 optimizer 失败后中断, scheduler 没被加载)
+            if scheduler_bin.exists():
+                try:
+                    sched_state = torch.load(scheduler_bin, map_location="cpu")
+                    lr_scheduler.load_state_dict(sched_state)
+                    # 验证: get_last_lr() 应该返回接近原来 1e-5 的 LR
+                    last_lrs = lr_scheduler.get_last_lr()
+                    accelerator.print(
+                        f"[patch] 已恢复 scheduler.bin, LR = {last_lrs[0]:.2e} "
+                        f"(避免 LR 从 schedule 起点重置)"
+                    )
+                except Exception as e:
+                    accelerator.print(f"[patch] scheduler 恢复失败: {e}, LR 将从 schedule 起点重新开始")
+
             global_step = int(path.split("-")[1])
 
             initial_global_step = global_step

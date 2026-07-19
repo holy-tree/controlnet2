@@ -103,12 +103,12 @@ class ARCAResidualCalibrator(nn.Module):
 
         # 7) 分层独立可学习门控 gate (sigmoid 输出 ∈ (0, 1)).
         # 作用: 在 alpha 之外再叠一层 0~1 缩放, 用于把 down_arca 等 R>1 的位置压回 0.3~0.5.
-        # 初始值 4.0 → sigmoid(4.0) ≈ 0.98, 几乎等于 1.0 (无作用).
-        # 这样:
-        #   - 从已有 checkpoint 接续训练时, 初始行为不变 (避免突然的残差缩放冲击)
-        #   - optimizer 在训练过程中自动把 gate 学到合适的压制值
-        #   - 如果某层本来 R<1, optimizer 会让 gate 维持 ~1 (无副作用)
-        self.gate = nn.Parameter(torch.tensor(4.0), requires_grad=True)
+        # 初始值 1.0 → sigmoid(1.0) ≈ 0.731 (温和起步, 给 30% 的压制空间).
+        # 注意: 比原 4.0 (sigmoid=0.982) 有 ~10x 更大的梯度流 (sigmoid'(1)=0.197 vs 0.018),
+        #       让 optimizer 能在合理时间内把 gate 降到目标值.
+        # 副作用: 从 checkpoint 接续时, 初始 residual 缩小 ~25%, 前几百 step 可能 loss 小幅波动.
+        #        但这是为了让 gate 真正可学的必要代价.
+        self.gate = nn.Parameter(torch.tensor(1.0), requires_grad=True)
 
         # 残差 cache: 训练时序监控需要 std(res), 缓存在 self._last_residual_stats
         # 仅在 self.training 模式下填充, 避免污染推理路径
