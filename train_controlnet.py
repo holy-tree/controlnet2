@@ -1574,29 +1574,35 @@ def main(args):
                     lr_scheduler.load_state_dict(sched_state)
 
                     # === Patch: 修复 lr_lambdas 与 base_lrs 长度不一致
-                    #     老 checkpoint 保存时 optimizer 只有 N 个 param groups,
-                    #     新代码可能改了 param groups 数 (如加了 gate),
-                    #     导致 state_dict 里的 base_lrs 长度 != 当前 lr_lambdas 长度
-                    #     → zip(base_lrs, lr_lambdas) 时 ValueError
-                    if hasattr(lr_scheduler, "lr_lambdas") and hasattr(lr_scheduler, "base_lrs"):
-                        n_lambda = len(lr_scheduler.lr_lambdas)
-                        n_base = len(lr_scheduler.base_lrs)
-                        if n_base != n_lambda:
+                    #     lr_scheduler 是 AcceleratedScheduler 包装层, 真正的 PyTorch LambdaLR
+                    #     在 lr_scheduler.scheduler 上. 老 state_dict 里的 base_lrs 长度是
+                    #     旧 param group 数 (无 gate = 2), 当前是 3 (有 gate), 导致 zip 失败.
+                    underlying = lr_scheduler
+                    # 如果是 accelerate 包装的, 找底层 PyTorch LambdaLR
+                    if hasattr(lr_scheduler, "scheduler"):
+                        cand = lr_scheduler.scheduler
+                        if hasattr(cand, "lr_lambdas"):
+                            underlying = cand
+
+                    if hasattr(underlying, "lr_lambdas") and hasattr(underlying, "base_lrs"):
+                        n_lambda = len(underlying.lr_lambdas)
+                        n_base = len(underlying.base_lrs)
+                        n_target = len(underlying.optimizer.param_groups)
+                        if n_base != n_target or n_lambda != n_target:
                             accelerator.print(
-                                f"[patch] 修复 lr_lambdas/base_lrs 长度不匹配: "
-                                f"lr_lambdas={n_lambda}, base_lrs={n_base}"
+                                f"[patch] 同步 base_lrs/lr_lambdas: "
+                                f"lr_lambdas={n_lambda}, base_lrs={n_base}, "
+                                f"optimizer.param_groups={n_target}"
                             )
-                            # 重新从当前 optimizer 取 base_lrs (覆盖老 state 里的值)
-                            lr_scheduler.base_lrs = [
-                                g["lr"] for g in lr_scheduler.optimizer.param_groups
+                            # 从当前 optimizer 取 base_lrs (覆盖老 state 值)
+                            underlying.base_lrs = [
+                                g["lr"] for g in underlying.optimizer.param_groups
                             ]
                             # 扩展或截断 lr_lambdas 到一致长度
-                            n_current = len(lr_scheduler.base_lrs)
-                            lr_scheduler.lr_lambdas = list(lr_scheduler.lr_lambdas)
-                            if n_lambda < n_current:
-                                lr_scheduler.lr_lambdas += [lr_scheduler.lr_lambdas[0]] * (n_current - n_lambda)
-                            elif n_lambda > n_current:
-                                lr_scheduler.lr_lambdas = lr_scheduler.lr_lambdas[:n_current]
+                            underlying.lr_lambdas = list(underlying.lr_lambdas)
+                            while len(underlying.lr_lambdas) < n_target:
+                                underlying.lr_lambdas.append(underlying.lr_lambdas[0])
+                            underlying.lr_lambdas = underlying.lr_lambdas[:n_target]
 
                     # 验证: get_last_lr() 应该返回接近原来 1e-5 的 LR
                     last_lrs = lr_scheduler.get_last_lr()
