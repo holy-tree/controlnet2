@@ -63,7 +63,11 @@ class WeatherDegradationEncoder(nn.Module):
         # 注意: proj_64 输入仍是 stem_channels (从 down_blocks 输出取)
         self.proj_64 = nn.Conv2d(stem_channels, 320, 1)
         # Phase 4 新增: proj_128 把 128x128 特征投影到 320 通道, 上采样注入 F64
+        # 关键: weight/bias 初始化为 0 → 训练初期 F128 贡献为 0, 不破坏已学 F64
+        # 训练过程中 proj_128 慢慢学到东西, F128 贡献逐渐出现
         self.proj_128 = nn.Conv2d(stem_channels, 320, 1)
+        nn.init.zeros_(self.proj_128.weight)
+        nn.init.zeros_(self.proj_128.bias)
         self.proj_32 = nn.Conv2d(320, 640, 1)
         self.proj_16 = nn.Conv2d(640, 1280, 1)
         self.proj_8 = nn.Conv2d(1280, 1280, 1)

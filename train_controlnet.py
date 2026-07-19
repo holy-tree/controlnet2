@@ -1631,6 +1631,23 @@ def main(args):
                         f"(直接乘子无 gate 等价行为)"
                     )
 
+                # === Patch: 把 proj_128 权重置 0
+                #     老 checkpoint 加载时 proj_128 是随机初始化 (旧代码里没设 0 init),
+                #     随机权重注入 F64 会污染已学特征 (实测让 PSNR 从 18.11 跌到 14)
+                #     重置为 0 后初始行为 = 无 F128 注入, 与 baseline 一致
+                #     训练过程中 proj_128 慢慢学到非零权重, F128 贡献逐渐出现
+                proj_reset_count = 0
+                for n, p in controlnet.named_parameters():
+                    if n.endswith("proj_128.weight") or n.endswith("proj_128.bias"):
+                        if p.data.abs().max() > 1e-6:
+                            p.data.zero_()
+                            proj_reset_count += 1
+                if proj_reset_count > 0:
+                    accelerator.print(
+                        f"[patch] 重置 proj_128 权重为 0 "
+                        f"(避免随机权重污染 F64, F128 注入从零开始)"
+                    )
+
             global_step = int(path.split("-")[1])
 
             initial_global_step = global_step
