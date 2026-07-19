@@ -101,6 +101,15 @@ class ARCAResidualCalibrator(nn.Module):
         #   - 但 alpha 梯度链路立刻打通, 训练能持续学
         self.alpha = nn.Parameter(torch.full((1,), 0.1), requires_grad=True)
 
+        # 7) 分层独立可学习门控 gate (sigmoid 输出 ∈ (0, 1)).
+        # 作用: 在 alpha 之外再叠一层 0~1 缩放, 用于把 down_arca 等 R>1 的位置压回 0.3~0.5.
+        # 初始值 4.0 → sigmoid(4.0) ≈ 0.98, 几乎等于 1.0 (无作用).
+        # 这样:
+        #   - 从已有 checkpoint 接续训练时, 初始行为不变 (避免突然的残差缩放冲击)
+        #   - optimizer 在训练过程中自动把 gate 学到合适的压制值
+        #   - 如果某层本来 R<1, optimizer 会让 gate 维持 ~1 (无副作用)
+        self.gate = nn.Parameter(torch.tensor(4.0), requires_grad=True)
+
         # 残差 cache: 训练时序监控需要 std(res), 缓存在 self._last_residual_stats
         # 仅在 self.training 模式下填充, 避免污染推理路径
         self._last_residual_stats: dict | None = None
@@ -113,13 +122,16 @@ class ARCAResidualCalibrator(nn.Module):
         h = self.ln2(h)
         h = self.zero_conv(h)
         scale = torch.tanh(self.alpha)
-        residual = scale * h
+        gate = torch.sigmoid(self.gate)             # 0~1 缩放, 初始 ≈1 (对已训模型无冲击)
+        residual = gate * scale * h
         if self.training:
             with torch.no_grad():
                 self._last_residual_stats = {
                     "abs_mean": residual.detach().float().abs().mean().item(),
                     "std": residual.detach().float().std().item(),
                     "scale": scale.detach().item(),
+                    "gate": gate.detach().item(),
+                    "effective_scale": (gate * scale).detach().item(),
                 }
         return residual
 
@@ -160,6 +172,8 @@ def collect_arca_monitor(model: nn.Module) -> list[dict]:
                 "name": name,
                 "alpha": float(mod.alpha.detach().item()),
                 "tanh_alpha": float(torch.tanh(mod.alpha).detach().item()),
+                "gate_raw": float(mod.gate.detach().item()),
+                "gate": float(torch.sigmoid(mod.gate).detach().item()),
             }
             if mod._last_residual_stats is not None:
                 r.update(mod._last_residual_stats)
@@ -171,7 +185,7 @@ def format_arca_monitor(records: list[dict], unet_hidden_stds: list[float] | Non
                         ) -> str:
     """
     渲染监控表:
-      header:  stage | alpha | tanh(alpha) | scale | res_std | unet_std | R
+      header:  stage | alpha | tanh(alpha) | scale | gate | eff_scale | res_std | unet_std | R
     unet_hidden_stds: 与 records 等长的列表, 给出同位置 UNet 隐特征 std.
                       若为 None 或长度不匹配, unet_std / R 列显示 N/A.
                       论文 method 章节做消融时由调用方 hook UNet 提供.
@@ -180,28 +194,31 @@ def format_arca_monitor(records: list[dict], unet_hidden_stds: list[float] | Non
     lines = ["# ARCA 监控"]
     if has_unet:
         lines.append(
-            f"{'name':<42} {'alpha':>10} {'tanh':>8} {'scale':>8} "
-            f"{'res_std':>11} {'unet_std':>11} {'R':>9}"
+            f"{'name':<42} {'alpha':>10} {'tanh':>8} {'scale':>8} {'gate':>6} "
+            f"{'eff_s':>7} {'res_std':>11} {'unet_std':>11} {'R':>9}"
         )
     else:
         lines.append(
-            f"{'name':<42} {'alpha':>10} {'tanh':>8} {'scale':>8} {'res_std':>11}  "
-            f"(unet_std/R 需 hook UNet 提供)"
+            f"{'name':<42} {'alpha':>10} {'tanh':>8} {'scale':>8} {'gate':>6} "
+            f"{'eff_s':>7} {'res_std':>11}  (unet_std/R 需 hook UNet 提供)"
         )
-    lines.append("-" * 100)
+    lines.append("-" * 110)
     for i, r in enumerate(records):
         scale = r.get("scale", float("nan"))
+        gate = r.get("gate", float("nan"))
+        eff = r.get("effective_scale", scale * gate if (scale == scale and gate == gate) else float("nan"))
         res_std = r.get("std", float("nan"))
         if has_unet:
             unet_std = unet_hidden_stds[i]
             r_ratio = (res_std / unet_std) if (unet_std and unet_std > 0) else float("nan")
             lines.append(
                 f"{r['name']:<42} {r['alpha']:>10.4f} {r['tanh_alpha']:>8.4f} {scale:>8.4f} "
+                f"{gate:>6.3f} {eff:>7.4f} "
                 f"{res_std:>11.4e} {unet_std:>11.4e} {r_ratio:>9.4f}"
             )
         else:
             lines.append(
                 f"{r['name']:<42} {r['alpha']:>10.4f} {r['tanh_alpha']:>8.4f} {scale:>8.4f} "
-                f"{res_std:>11.4e}    N/A                  N/A"
+                f"{gate:>6.3f} {eff:>7.4f} {res_std:>11.4e}    N/A                  N/A"
             )
     return "\n".join(lines)
