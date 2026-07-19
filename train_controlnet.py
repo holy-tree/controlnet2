@@ -85,8 +85,9 @@ class LoRALinear(nn.Module):
         out_features = original_linear.out_features
 
         # LoRA 矩阵 (A 随机, B 零)
-        self.lora_A = nn.Parameter(torch.empty(rank, in_features))
-        self.lora_B = nn.Parameter(torch.zeros(out_features, rank))
+        # 强制 fp32, 防止 autocast 把 grad 变成 fp16 触发 GradScaler 错误
+        self.lora_A = nn.Parameter(torch.empty(rank, in_features, dtype=torch.float32))
+        self.lora_B = nn.Parameter(torch.zeros(out_features, rank, dtype=torch.float32))
         self.scaling = alpha / rank
         self.lora_dropout = nn.Dropout(lora_dropout) if lora_dropout > 0 else nn.Identity()
 
