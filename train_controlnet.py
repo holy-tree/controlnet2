@@ -1508,7 +1508,32 @@ def main(args):
             initial_global_step = 0
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
-            accelerator.load_state(os.path.join(args.output_dir, path))
+            full_ckpt_path = os.path.join(args.output_dir, path)
+
+            # === Patch: 当模型新增参数 (如 ARCA gate) 时, 旧 optimizer state 大小不匹配
+            #     会报 "parameter group that doesn't match the size of optimizer's group".
+            #     处理方案: 删除 optimizer.bin, 让 accelerate 跳过 optimizer 加载,
+            #     Adam momentum/variance 重新初始化 (代价可控, LR scheduler 状态保留).
+            opt_bin = Path(full_ckpt_path) / "optimizer.bin"
+            if opt_bin.exists():
+                backup = Path(full_ckpt_path) / "optimizer.bin.bak"
+                if not backup.exists():
+                    shutil.copy2(opt_bin, backup)
+                    accelerator.print(f"[patch] 备份旧 optimizer → {backup.name}")
+                opt_bin.unlink()
+                accelerator.print(
+                    "[patch] 已删除 optimizer.bin (新参数 gate 不兼容旧 Adam state, "
+                    "模型权重已加载, Adam 重新初始化)"
+                )
+
+            try:
+                accelerator.load_state(full_ckpt_path)
+            except FileNotFoundError as e:
+                # optimizer.bin 已删, accelerate 跳过 optimizer 加载, 这里吃掉 FileNotFoundError
+                if "optimizer" in str(e).lower():
+                    accelerator.print(f"[patch] 跳过 optimizer 加载: {e}")
+                else:
+                    raise
             global_step = int(path.split("-")[1])
 
             initial_global_step = global_step
