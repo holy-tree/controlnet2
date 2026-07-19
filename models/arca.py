@@ -101,13 +101,16 @@ class ARCAResidualCalibrator(nn.Module):
         #   - 但 alpha 梯度链路立刻打通, 训练能持续学
         self.alpha = nn.Parameter(torch.full((1,), 0.1), requires_grad=True)
 
-        # 7) 分层独立可学习门控 gate (sigmoid 输出 ∈ (0, 1)).
-        # 作用: 在 alpha 之外再叠一层 0~1 缩放, 用于把 down_arca 等 R>1 的位置压回 0.3~0.5.
-        # 初始值 1.0 → sigmoid(1.0) ≈ 0.731 (温和起步, 给 30% 的压制空间).
-        # 注意: 比原 4.0 (sigmoid=0.982) 有 ~10x 更大的梯度流 (sigmoid'(1)=0.197 vs 0.018),
-        #       让 optimizer 能在合理时间内把 gate 降到目标值.
-        # 副作用: 从 checkpoint 接续时, 初始 residual 缩小 ~25%, 前几百 step 可能 loss 小幅波动.
-        #        但这是为了让 gate 真正可学的必要代价.
+        # 7) 分层独立可学习门控 gate (直接乘子, 无 sigmoid 包裹).
+        # 作用: 在 alpha 之外再叠一层可学习缩放, 用于把 down_arca 等 R>1 的位置压回 0.3~0.5.
+        # 初始值 1.0 → residual = 1.0 * scale * h, 与 gate 引入前完全相同, 不破坏已有模型.
+        # 设计原因: sigmoid gate 在 init=4.0 时梯度只有 0.018 (sigmoid saturation),
+        #          在 init=1.0 时初始行为又破坏模型. 直接乘子避免两个问题:
+        #          - 初始行为 100% 等价于原模型 (接续训练无冲击)
+        #          - 梯度永远是 gate*grad_loss, 不会饱和
+        #          - 学习目标明确: gate 降从 1.0 → ~0.3 (down_arca)
+        # 配合 train_controlnet.py 中 gate 单独 param group (lr=5e-4, weight_decay=0),
+        # 期望 50k 内 gate 从 1.0 降到 0.5~0.7 (down_arca 进一步降到 0.3).
         self.gate = nn.Parameter(torch.tensor(1.0), requires_grad=True)
 
         # 残差 cache: 训练时序监控需要 std(res), 缓存在 self._last_residual_stats
@@ -122,7 +125,7 @@ class ARCAResidualCalibrator(nn.Module):
         h = self.ln2(h)
         h = self.zero_conv(h)
         scale = torch.tanh(self.alpha)
-        gate = torch.sigmoid(self.gate)             # 0~1 缩放, 初始 ≈1 (对已训模型无冲击)
+        gate = self.gate                              # 直接乘子, 不饱和, init=1.0 完全等价于原模型
         residual = gate * scale * h
         if self.training:
             with torch.no_grad():

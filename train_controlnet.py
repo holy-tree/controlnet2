@@ -560,6 +560,11 @@ def parse_args(input_args=None):
                              "远小于 --learning_rate, 防止 alpha 增长过快).")
     parser.add_argument("--arca_alpha_weight_decay", type=float, default=0.0,
                         help="stage_alpha 的 weight_decay (默认 0, 不应加衰减).")
+    parser.add_argument("--gate_lr", type=float, default=5e-4,
+                        help="ARCA gate 单独学习率 (直接乘子无 saturation, "
+                             "需较高 LR 让 gate 从 1.0 降到目标值 0.3~0.5).")
+    parser.add_argument("--gate_weight_decay", type=float, default=0.0,
+                        help="ARCA gate 的 weight_decay (默认 0, 让 gate 可自由降到 < 1).")
     parser.add_argument("--arca_log_interval", type=int, default=500,
                         help="每 N 步打印一次 7 层 alpha + 残差 std 监控表.")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
@@ -1280,28 +1285,43 @@ def main(args):
 
     # Optimizer creation
     # ARCA-aware 分组: 7 个 stage_alpha 用单独小 lr (--arca_lr),
+    # 7 个 stage_gate 用单独高 lr (--gate_lr, 直接乘子需要快速学习),
     # 其余 controlnet 参数 (含 7 个 zero_conv + DWConv/PWConv/LN + 编码器) 用 --learning_rate.
-    alpha_params, other_params = [], []
+    alpha_params, gate_params, other_params = [], [], []
     for name, p in controlnet.named_parameters():
         if not p.requires_grad:
             continue
         if name.endswith(".alpha"):
             alpha_params.append(p)
+        elif name.endswith(".gate"):
+            gate_params.append(p)
         else:
             other_params.append(p)
     if alpha_params:
         print(f"[ARCA] 检测到 {len(alpha_params)} 个 stage_alpha 参数, "
               f"lr={args.arca_lr}, weight_decay={args.arca_alpha_weight_decay}")
-        param_groups = [
-            {"params": other_params, "lr": args.learning_rate,
-             "weight_decay": args.adam_weight_decay},
-            {"params": alpha_params, "lr": args.arca_lr,
-             "weight_decay": args.arca_alpha_weight_decay,
-             "name": "arca_alpha"},
-        ]
-    else:
-        param_groups = [{"params": other_params, "lr": args.learning_rate,
-                        "weight_decay": args.adam_weight_decay}]
+    if gate_params:
+        print(f"[ARCA] 检测到 {len(gate_params)} 个 stage_gate 参数, "
+              f"lr={args.gate_lr}, weight_decay={args.gate_weight_decay}")
+    param_groups = [
+        {"params": other_params, "lr": args.learning_rate,
+         "weight_decay": args.adam_weight_decay},
+    ]
+    if alpha_params:
+        param_groups.append({
+            "params": alpha_params, "lr": args.arca_lr,
+            "weight_decay": args.arca_alpha_weight_decay,
+            "name": "arca_alpha",
+        })
+    if gate_params:
+        param_groups.append({
+            "params": gate_params, "lr": args.gate_lr,
+            "weight_decay": args.gate_weight_decay,
+            "name": "arca_gate",
+        })
+    if not alpha_params and not gate_params:
+        # Fallback: 不应该发生, 但保留以防 ARCA 结构变更
+        pass
     optimizer = optimizer_class(
         param_groups,
         lr=args.learning_rate,
@@ -1560,6 +1580,24 @@ def main(args):
                     )
                 except Exception as e:
                     accelerator.print(f"[patch] scheduler 恢复失败: {e}, LR 将从 schedule 起点重新开始")
+
+            # === Patch: 把所有 gate 重置为 1.0 (直接乘子等价于无 gate)
+            #     因为 checkpoint-140000 里的 gate 是 4.0 (旧 sigmoid init) 或 1.0 (上次重置)
+            #     新代码用直接乘子, gate=4.0 会让 residual 放 4x (破坏模型),
+            #     所以必须重置到 1.0 才能保证初始行为与无 gate 一致.
+            with torch.no_grad():
+                reset_count = 0
+                for n, p in controlnet.named_parameters():
+                    if n.endswith(".gate"):
+                        old_val = p.data.item()
+                        if abs(old_val - 1.0) > 1e-6:
+                            p.data.fill_(1.0)
+                            reset_count += 1
+                if reset_count > 0:
+                    accelerator.print(
+                        f"[patch] 重置 {reset_count} 个 gate 参数为 1.0 "
+                        f"(直接乘子无 gate 等价行为)"
+                    )
 
             global_step = int(path.split("-")[1])
 
