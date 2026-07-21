@@ -168,9 +168,8 @@ class C2FBlock(nn.Module):
         self.conv3 = nn.Conv2d(dw_channel // 2, c, 3, 1, 1,
                                bias=True, groups=dw_channel // 2)
         self.dropout1 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
-        # beta: 残差缩放 (粗融合阶段). 原本 init=0 导致 C2FBlock.forward 等价恒等,
-        # 25M 参数几乎不参与优化. 改为 0.1 让训练初期就有非零梯度链路.
-        # 注意: 接续已有 checkpoint 时, state_dict 会覆盖这个 init, 仅对从头训练有效.
+        # beta: 残差缩放 (粗融合阶段). init=0.1 让 C2FBlock 训练初期就参与优化.
+        # (之前 init=0 等价恒等, 25M 参数完全浪费; 这是 Phase 5 重要架构修复)
         self.beta = nn.Parameter(torch.full((1, c, 1, 1), 0.1), requires_grad=True)
 
         self.norm2 = LayerNorm(c)
@@ -178,7 +177,7 @@ class C2FBlock(nn.Module):
         self.conv4 = nn.Conv2d(c, ffn_channel, 1, 1, 0, bias=True)
         self.conv5 = nn.Conv2d(ffn_channel // 2, c, 1, 1, 0, bias=True)
         self.dropout2 = nn.Dropout(drop_out_rate) if drop_out_rate > 0. else nn.Identity()
-        # gamma: 残差缩放 (细融合阶段). 同 beta, init=0 → C2F 等价恒等; 改为 0.1.
+        # gamma: 残差缩放 (细融合阶段). init=0.1 让 C2F 立刻参与训练.
         self.gamma = nn.Parameter(torch.full((1, c, 1, 1), 0.1), requires_grad=True)
 
     def forward(self, x):

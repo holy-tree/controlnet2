@@ -656,6 +656,8 @@ def parse_args(input_args=None):
                         help="LoRA alpha (通常 = 2*rank).")
     parser.add_argument("--lora_dropout", type=float, default=0.0,
                         help="LoRA dropout (默认 0, 不用 dropout).")
+    parser.add_argument("--lora_lr", type=float, default=1e-4,
+                        help="LoRA 矩阵 (lora_A, lora_B) 的学习率, 通常高于主学习率 (默认 1e-4).")
     parser.add_argument("--lora_target_modules", type=str, default="to_q,to_v",
                         help="要加 LoRA 的模块名 (逗号分隔), 默认 'to_q,to_v' (Q/V 投影).")
     parser.add_argument("--arca_log_interval", type=int, default=500,
@@ -1283,28 +1285,56 @@ def main(args):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
-                i = len(weights) - 1
-
+                # 修复 Bug #1: 必须同时保存 UNet LoRA 权重 (lora_A / lora_B)
+                # 否则 eval 时 UNet 是 vanilla, 与 train 时带 LoRA delta 的 forward 不一致
+                # 注意: models 经过 accelerator.prepare 后可能被 DDP 等包装, 用 unwrap_model 取回原类
+                for model in models:
+                    try:
+                        raw_model = accelerator.unwrap_model(model)
+                    except Exception:
+                        raw_model = model
+                    if isinstance(raw_model, WeatherRestorationControlNet):
+                        # ControlNet 主干 -> controlnet/
+                        model.save_pretrained(os.path.join(output_dir, "controlnet"))
+                    elif isinstance(raw_model, UNet2DConditionModel):
+                        # UNet LoRA -> unet_lora.bin (只保存 lora_A / lora_B, UNet 主体不变)
+                        lora_state = {
+                            k: v.cpu() for k, v in model.state_dict().items()
+                            if "lora_A" in k or "lora_B" in k
+                        }
+                        if lora_state:
+                            torch.save(lora_state, os.path.join(output_dir, "unet_lora.bin"))
+                            print(f"[save_hook] 保存 {len(lora_state)} 个 UNet LoRA 参数")
+                # 清空 weights 列表 (accelerate 会再用这个列表做其他事)
                 while len(weights) > 0:
                     weights.pop()
-                    model = models[i]
-
-                    sub_dir = "controlnet"
-                    model.save_pretrained(os.path.join(output_dir, sub_dir))
-
-                    i -= 1
 
         def load_model_hook(models, input_dir):
             while len(models) > 0:
                 # pop models so that they are not loaded again
                 model = models.pop()
 
-                # load diffusers style into model
-                load_model = WeatherRestorationControlNet.from_pretrained(input_dir, subfolder="controlnet")
-                model.register_to_config(**load_model.config)
-
-                model.load_state_dict(load_model.state_dict())
-                del load_model
+                # unwrap DDP/Accelerator 包装以判断真实类型
+                try:
+                    raw_model = accelerator.unwrap_model(model)
+                except Exception:
+                    raw_model = model
+                if isinstance(raw_model, WeatherRestorationControlNet):
+                    # load diffusers style into model
+                    load_model = WeatherRestorationControlNet.from_pretrained(input_dir, subfolder="controlnet")
+                    model.register_to_config(**load_model.config)
+                    model.load_state_dict(load_model.state_dict())
+                    del load_model
+                elif isinstance(raw_model, UNet2DConditionModel):
+                    # 修复 Bug #1 配套: 恢复 UNet LoRA 权重
+                    lora_path = os.path.join(input_dir, "unet_lora.bin")
+                    if os.path.isfile(lora_path):
+                        lora_state = torch.load(lora_path, map_location="cpu")
+                        missing, unexpected = model.load_state_dict(lora_state, strict=False)
+                        print(f"[load_hook] 加载 {len(lora_state)} 个 UNet LoRA 参数 "
+                              f"(missing={len(missing)}, unexpected={len(unexpected)})")
+                    else:
+                        print(f"[load_hook] 警告: 未找到 {lora_path}, UNet LoRA 权重未恢复")
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
@@ -1425,7 +1455,7 @@ def main(args):
                 lora_params.append(p)
         if lora_params:
             print(f"[Phase 5: LoRA] 检测到 {len(lora_params)} 个 UNet LoRA 参数, "
-                  f"lr={args.learning_rate}")
+                  f"lr={args.lora_lr}")
 
     if alpha_params:
         print(f"[ARCA] 检测到 {len(alpha_params)} 个 stage_alpha 参数, "
@@ -1439,7 +1469,7 @@ def main(args):
     ]
     if lora_params:
         param_groups.append({
-            "params": lora_params, "lr": args.learning_rate,
+            "params": lora_params, "lr": args.lora_lr,
             "weight_decay": args.adam_weight_decay,
             "name": "unet_lora",
         })
@@ -1639,7 +1669,7 @@ def main(args):
     logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+    logger.info(f"  Total train batch size (w. parallel, accumulation) = {total_batch_size}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
     global_step = 0
@@ -2020,6 +2050,8 @@ def main(args):
                         )
 
                     # ===== 按 step 评估 PSNR/SSIM (放在内层循环内, 这样 global_step % N == 0 时才被检查) =====
+                    # 注意: 训练时 n=4 验证只是"相对参考", 不可作为 best 依据
+                    # 真实 best 必须靠手动跑 n=200 eval 决定
                     if (args.run_validation
                             and args.run_validation_steps > 0
                             and global_step > 0
@@ -2242,6 +2274,12 @@ def run_epoch_validation(vae, unet, controlnet, text_encoder, tokenizer, acceler
     logger.info(f"[Epoch {epoch}] 验证完成, 结果保存到: {val_root}")
     del pipeline
     torch.cuda.empty_cache()
+
+    # 返回平均 PSNR (best model tracking 用)
+    if weather_metrics:
+        return avg_psnr
+    else:
+        return None
 
 
 if __name__ == "__main__":

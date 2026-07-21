@@ -232,6 +232,52 @@ def build_pipeline(args_config: dict, device, dtype):
     )
     pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
 
+    # 修复 Bug #2: eval 必须构造 UNet LoRA wrapper 并加载 LoRA 权重
+    # 否则 UNet forward 不加 LoRA delta, 与 train 时不一致
+    use_unet_lora = args_config.get("use_unet_lora", False)
+    if use_unet_lora:
+        from train_controlnet import apply_lora_to_unet
+        unet = pipeline.unet
+        target_modules = args_config.get("lora_target_modules", "to_q,to_v").split(",")
+        target_modules = [m.strip() for m in target_modules if m.strip()]
+        n_wrapped, _ = apply_lora_to_unet(
+            unet,
+            rank=args_config.get("lora_rank", 16),
+            alpha=args_config.get("lora_alpha", 32),
+            target_module_names=target_modules,
+            lora_dropout=0.0,  # eval 时 dropout 必须为 0
+        )
+        print(f"[eval] UNet LoRA wrapper 已构造 ({n_wrapped} 个 Linear)")
+
+        # 加载 LoRA 权重 (从 controlnet 路径的同级目录)
+        # cn_path 可能是 .../controlnet 或 .../checkpoint-XXX/controlnet
+        cn_dir = Path(cn_path).resolve()
+        # 向上找 unet_lora.bin: 可能在 controlnet/ 同级 (即 checkpoint-XXX/)
+        if cn_dir.name == "controlnet":
+            ckpt_dir = cn_dir.parent
+        else:
+            ckpt_dir = cn_dir
+        lora_path = ckpt_dir / "unet_lora.bin"
+        if not lora_path.is_file():
+            # 兜底: 在 output_dir 的所有 checkpoint 中找最新的
+            out_root = cn_dir
+            while out_root.parent != out_root:
+                out_root = out_root.parent
+                candidates = sorted(out_root.glob("checkpoint-*/unet_lora.bin"))
+                if candidates:
+                    lora_path = candidates[-1]
+                    print(f"[eval] 自动选择最新 LoRA: {lora_path}")
+                    break
+        if lora_path.is_file():
+            lora_state = torch.load(lora_path, map_location="cpu")
+            missing, unexpected = unet.load_state_dict(lora_state, strict=False)
+            print(f"[eval] 加载 LoRA: {len(lora_state)} 个参数 "
+                  f"(missing={len(missing)}, unexpected={len(unexpected)})")
+        else:
+            print(f"[eval] 警告: 未找到 {lora_path}, UNet 不含 LoRA 权重 (等价无 LoRA)")
+
+        unet.eval()
+
     # 防御: pipeline 某些子模块可能落在 meta device (load_state_dict_with_low_cpu_mem 用),
     # 直接 .to() 会触发 NotImplementedError, 此时需要 .to_empty() 跨过 meta
     try:
