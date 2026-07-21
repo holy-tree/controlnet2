@@ -1283,28 +1283,31 @@ def main(args):
     # `accelerate` 0.16.0 will have better support for customized saving
     if version.parse(accelerate.__version__) >= version.parse("0.16.0"):
         # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
+        # 关键: accelerator.save_state 只把 prepare 过的模型 (controlnet) 放入 hook 的 models 列表.
+        #      unet 没被 prepare, 不会被自动传入. 因此必须显式引用外部 unet 变量.
         def save_model_hook(models, weights, output_dir):
             if accelerator.is_main_process:
-                # 修复 Bug #1: 必须同时保存 UNet LoRA 权重 (lora_A / lora_B)
-                # 否则 eval 时 UNet 是 vanilla, 与 train 时带 LoRA delta 的 forward 不一致
-                # 注意: models 经过 accelerator.prepare 后可能被 DDP 等包装, 用 unwrap_model 取回原类
+                # Phase A: 保存 ControlNet 主干 (来自 hook models 列表)
                 for model in models:
                     try:
                         raw_model = accelerator.unwrap_model(model)
                     except Exception:
                         raw_model = model
                     if isinstance(raw_model, WeatherRestorationControlNet):
-                        # ControlNet 主干 -> controlnet/
                         model.save_pretrained(os.path.join(output_dir, "controlnet"))
-                    elif isinstance(raw_model, UNet2DConditionModel):
-                        # UNet LoRA -> unet_lora.bin (只保存 lora_A / lora_B, UNet 主体不变)
-                        lora_state = {
-                            k: v.cpu() for k, v in model.state_dict().items()
-                            if "lora_A" in k or "lora_B" in k
-                        }
-                        if lora_state:
-                            torch.save(lora_state, os.path.join(output_dir, "unet_lora.bin"))
-                            print(f"[save_hook] 保存 {len(lora_state)} 个 UNet LoRA 参数")
+                # Phase B: 保存 UNet LoRA 权重 (显式引用外部 unet, 不依赖 hook models)
+                #   因为 accelerate._models 只有 controlnet, UNet 不会被传进来
+                if args.use_unet_lora:
+                    lora_state = {
+                        k: v.cpu() for k, v in unet.state_dict().items()
+                        if "lora_A" in k or "lora_B" in k
+                    }
+                    if lora_state:
+                        torch.save(lora_state, os.path.join(output_dir, "unet_lora.bin"))
+                        logger.info(f"[save_hook] 保存 {len(lora_state)} 个 UNet LoRA 参数")
+                    else:
+                        logger.warning("[save_hook] use_unet_lora=true 但 UNet 中无 lora_A/lora_B 参数, "
+                                       "可能是 apply_lora_to_unet 未生效!")
                 # 清空 weights 列表 (accelerate 会再用这个列表做其他事)
                 while len(weights) > 0:
                     weights.pop()
@@ -1325,16 +1328,18 @@ def main(args):
                     model.register_to_config(**load_model.config)
                     model.load_state_dict(load_model.state_dict())
                     del load_model
-                elif isinstance(raw_model, UNet2DConditionModel):
-                    # 修复 Bug #1 配套: 恢复 UNet LoRA 权重
-                    lora_path = os.path.join(input_dir, "unet_lora.bin")
-                    if os.path.isfile(lora_path):
-                        lora_state = torch.load(lora_path, map_location="cpu")
-                        missing, unexpected = model.load_state_dict(lora_state, strict=False)
-                        print(f"[load_hook] 加载 {len(lora_state)} 个 UNet LoRA 参数 "
-                              f"(missing={len(missing)}, unexpected={len(unexpected)})")
-                    else:
-                        print(f"[load_hook] 警告: 未找到 {lora_path}, UNet LoRA 权重未恢复")
+
+            # 恢复 UNet LoRA 权重 (models 列表里没有 unet, 必须显式处理)
+            if args.use_unet_lora:
+                lora_path = os.path.join(input_dir, "unet_lora.bin")
+                if os.path.isfile(lora_path):
+                    lora_state = torch.load(lora_path, map_location="cpu")
+                    missing, unexpected = unet.load_state_dict(lora_state, strict=False)
+                    logger.info(f"[load_hook] 加载 {len(lora_state)} 个 UNet LoRA 参数 "
+                                f"(missing={len(missing)}, unexpected={len(unexpected)})")
+                else:
+                    logger.info(f"[load_hook] 警告: 未找到 {lora_path}, UNet LoRA 权重未恢复 "
+                                f"(LoRA 矩阵保持初始 Kaiming+Zero)")
 
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
