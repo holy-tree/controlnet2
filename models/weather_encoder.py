@@ -81,12 +81,19 @@ class WeatherDegradationEncoder(nn.Module):
         self.proj_16 = nn.Conv2d(640, 1280, 1)
         self.proj_8 = nn.Conv2d(1280, 1280, 1)
 
-    def forward(self, lq_img: torch.Tensor):
+    def forward(self, lq_img: torch.Tensor, return_shallow: bool = False):
         """
         Args:
             lq_img: [B, 3, H, W] 退化 RGB 图 (H, W 通常为 512, 需为 8 的倍数)
+            return_shallow: 是否额外返回三组浅层特征 (Phase 6: decoder skip 用)
         Returns:
-            [f64, f32, f16, f8]: 四级金字塔 (F64 已含高频注入)
+            默认: [f64, f32, f16, f8] 四级金字塔 (F64 已含高频注入)
+            return_shallow=True: dict {
+                'multi_scale': [f64, f32, f16, f8],  # 主干多尺度 (不变)
+                'feat_256': [B, 64, H/2,  W/2 ],      # 256 浅层 (decoder skip 分支 2)
+                'feat_128': [B, 64, H/4,  W/4 ],      # 128 浅层 (decoder skip 分支 1, 兼容旧接口)
+                'feat_64' : [B, 64, H/8,  W/8 ],      #  64 浅层 (decoder skip 分支 0)
+            }
                 f64: [B, 320, H/8, W/8]   ← 含 F128 上采样注入
                 f32: [B, 640, H/16, W/16]
                 f16: [B, 1280, H/32, W/32]
@@ -114,4 +121,12 @@ class WeatherDegradationEncoder(nn.Module):
         f16 = self.proj_16(F.avg_pool2d(f32, 2))      # [B, 1280, H/32, W/32]
         f8 = self.proj_8(F.avg_pool2d(f16, 2))        # [B, 1280, H/64, W/64]
 
-        return [f64, f32, f16, f8]
+        multi_scale = [f64, f32, f16, f8]
+        if return_shallow:
+            return {
+                'multi_scale': multi_scale,
+                'feat_256': feat_256,
+                'feat_128': feat_128,
+                'feat_64':  feat_64_base,
+            }
+        return multi_scale

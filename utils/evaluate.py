@@ -300,6 +300,135 @@ def build_pipeline(args_config: dict, device, dtype):
     return pipeline
 
 
+def build_pipeline_with_decoder_skip(args_config: dict, device, dtype):
+    """带 Decoder Skip 支持的 pipeline 构建 (Phase 6)."""
+    from pathlib import Path
+    cn_path = resolve_controlnet_path(args_config["controlnet_model_path"])
+    print(f"[eval] ControlNet 路径: {cn_path}")
+    controlnet = _load_controlnet_smart(cn_path)
+
+    pipeline = StableDiffusionControlNetPipeline.from_pretrained(
+        args_config["pretrained_model_name_or_path"],
+        controlnet=controlnet,
+        safety_checker=None,
+        torch_dtype=dtype,
+    )
+    pipeline.scheduler = UniPCMultistepScheduler.from_config(pipeline.scheduler.config)
+
+    # UNet LoRA wrapper
+    use_unet_lora = args_config.get("use_unet_lora", False)
+    if use_unet_lora:
+        from train_controlnet import apply_lora_to_unet
+        unet = pipeline.unet
+        target_modules = args_config.get("lora_target_modules", "to_q,to_v").split(",")
+        target_modules = [m.strip() for m in target_modules if m.strip()]
+        n_wrapped, _ = apply_lora_to_unet(
+            unet, rank=args_config.get("lora_rank", 16),
+            alpha=args_config.get("lora_alpha", 32),
+            target_module_names=target_modules, lora_dropout=0.0,
+        )
+        print(f"[eval] UNet LoRA wrapper 已构造 ({n_wrapped} 个 Linear)")
+        cn_dir = Path(cn_path).resolve()
+        if cn_dir.name == "controlnet":
+            ckpt_dir = cn_dir.parent
+        else:
+            ckpt_dir = cn_dir
+        lora_path = ckpt_dir / "unet_lora.bin"
+        if not lora_path.is_file():
+            out_root = cn_dir
+            while out_root.parent != out_root:
+                out_root = out_root.parent
+                candidates = sorted(out_root.glob("checkpoint-*/unet_lora.bin"))
+                if candidates:
+                    lora_path = candidates[-1]
+                    break
+        if lora_path.is_file():
+            lora_state = torch.load(lora_path, map_location="cpu")
+            unet.load_state_dict(lora_state, strict=False)
+            print(f"[eval] 加载 LoRA: {len(lora_state)} 个参数")
+        unet.eval()
+
+    # Phase 6: Decoder Skip
+    use_decoder_skip = args_config.get("use_decoder_skip", False)
+    if use_decoder_skip:
+        from models.decoder_skip import DecoderSkipPath
+        decoder_skip_module = DecoderSkipPath(in_ch=64, alpha_init=0.0)
+        decoder_skip_module = decoder_skip_module.to(device)
+        # 加载权重
+        cn_dir = Path(cn_path).resolve()
+        if cn_dir.name == "controlnet":
+            ckpt_dir = cn_dir.parent
+        else:
+            ckpt_dir = cn_dir
+        ds_path = ckpt_dir / "decoder_skip.bin"
+        if not ds_path.is_file():
+            out_root = cn_dir
+            while out_root.parent != out_root:
+                out_root = out_root.parent
+                candidates = sorted(out_root.glob("checkpoint-*/decoder_skip.bin"))
+                if candidates:
+                    ds_path = candidates[-1]
+                    break
+        if ds_path.is_file():
+            ds_state = torch.load(ds_path, map_location="cpu")
+            decoder_skip_module.load_state_dict(ds_state, strict=False)
+            print(f"[eval] 加载 Decoder Skip: {len(ds_state)} 个参数")
+        else:
+            print(f"[eval] 警告: 未找到 {ds_path}, Decoder Skip 权重未恢复")
+        controlnet.set_decoder_skip(decoder_skip_module)
+
+        # SD2 pipeline 用 return_dict=False 调用 controlnet, 解包 2-tuple, 无法直接传 decoder_skip.
+        # 解决方案: controlnet.forward 在 return_dict=False 时也把 decoder_skip 存到 self._last_decoder_skip,
+        # 然后 up_block hook 从 controlnet._last_decoder_skip 读 dict.
+        def make_decoder_skip_hook(block_idx, ctrl):
+            def hook(module, args):
+                if len(args) < 2:
+                    return args
+                hidden_states = args[0]
+                res_tuple = args[1]
+                if not isinstance(res_tuple, (tuple, list)) or len(res_tuple) == 0:
+                    return args
+                skip_dict = getattr(ctrl, '_last_decoder_skip', None)
+                if skip_dict is None:
+                    return args
+                decoder_skip = skip_dict.get(f'up_block_{block_idx}', None)
+                if decoder_skip is None:
+                    return args
+                target_shape = res_tuple[0].shape
+                if decoder_skip.shape != target_shape:
+                    return args
+                new_res_tuple = tuple(s + decoder_skip for s in res_tuple)
+                return (hidden_states, new_res_tuple) + args[2:]
+            return hook
+
+        # 在 unet.up_blocks 上注册 hooks
+        hooks = []
+        for block_idx in (0, 1, 2):
+            h = pipeline.unet.up_blocks[block_idx].register_forward_pre_hook(
+                make_decoder_skip_hook(block_idx, controlnet)
+            )
+            hooks.append(h)
+        print(f"[eval] Decoder Skip hooks 已注册 ({len(hooks)} 个 up_block)")
+
+    try:
+        pipeline = pipeline.to(device)
+    except (NotImplementedError, TypeError) as e:
+        print(f"[build_pipeline] .to() 触发错误 ({e}), 回退到 to_empty")
+        pipeline.to_empty(device=device)
+        if dtype != torch.float32:
+            pipeline = pipeline.to(dtype=dtype)
+
+    pipeline.set_progress_bar_config(disable=True)
+
+    if args_config.get("enable_xformers_memory_efficient_attention", False):
+        if is_xformers_available():
+            pipeline.enable_xformers_memory_efficient_attention()
+        else:
+            print("[warn] xformers 不可用, 已跳过")
+
+    return pipeline
+
+
 def maybe_make_prompt(weather: str, args_config: dict) -> str:
     """根据 use_prompt / prompt_ratio 决定是否使用天气 prompt"""
     if not args_config.get("use_prompt", False):

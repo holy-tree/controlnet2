@@ -662,6 +662,13 @@ def parse_args(input_args=None):
                         help="要加 LoRA 的模块名 (逗号分隔), 默认 'to_q,to_v' (Q/V 投影).")
     parser.add_argument("--arca_log_interval", type=int, default=500,
                         help="每 N 步打印一次 7 层 alpha + 残差 std 监控表.")
+    # === Phase 6: Decoder Skip Connection (LQ → SD2 UNet up_blocks) ===
+    parser.add_argument("--use_decoder_skip", action="store_true",
+                        help="是否启用 Decoder Skip Path (Phase 6), 从 encoder 浅层注入 SD2 UNet decoder.")
+    parser.add_argument("--decoder_skip_lr", type=float, default=3e-5,
+                        help="Decoder Skip Path 的学习率 (介于主网络 5e-5 和 LoRA 1e-4 之间, 默认 3e-5).")
+    parser.add_argument("--decoder_skip_alpha_lr", type=float, default=3e-6,
+                        help="Decoder Skip alpha 标量的学习率 (与 arca_lr 类似, 极小值, 默认 3e-6).")
     parser.add_argument("--push_to_hub", action="store_true", help="Whether or not to push the model to the Hub.")
     parser.add_argument("--hub_token", type=str, default=None, help="The token to use to push to the Model Hub.")
     parser.add_argument(
@@ -1311,6 +1318,11 @@ def main(args):
                 # 清空 weights 列表 (accelerate 会再用这个列表做其他事)
                 while len(weights) > 0:
                     weights.pop()
+                # Phase 6: 保存 decoder_skip 单独 checkpoint (因为 models 列表中也不包含它)
+                if args.use_decoder_skip and decoder_skip_module is not None:
+                    torch.save(decoder_skip_module.state_dict(),
+                               os.path.join(output_dir, "decoder_skip.bin"))
+                    logger.info("[save_hook] 保存 decoder_skip 权重")
 
         def load_model_hook(models, input_dir):
             while len(models) > 0:
@@ -1341,6 +1353,17 @@ def main(args):
                     logger.info(f"[load_hook] 警告: 未找到 {lora_path}, UNet LoRA 权重未恢复 "
                                 f"(LoRA 矩阵保持初始 Kaiming+Zero)")
 
+            # Phase 6: 恢复 decoder_skip 权重
+            if args.use_decoder_skip and decoder_skip_module is not None:
+                ds_path = os.path.join(input_dir, "decoder_skip.bin")
+                if os.path.isfile(ds_path):
+                    ds_state = torch.load(ds_path, map_location="cpu")
+                    missing, unexpected = decoder_skip_module.load_state_dict(ds_state, strict=False)
+                    logger.info(f"[load_hook] 加载 {len(ds_state)} 个 decoder_skip 参数 "
+                                f"(missing={len(missing)}, unexpected={len(unexpected)})")
+                else:
+                    logger.info(f"[load_hook] 警告: 未找到 {ds_path}, decoder_skip 权重未恢复")
+
         accelerator.register_save_state_pre_hook(save_model_hook)
         accelerator.register_load_state_pre_hook(load_model_hook)
 
@@ -1348,6 +1371,11 @@ def main(args):
     unet.requires_grad_(False)
     text_encoder.requires_grad_(False)
     controlnet.train()
+
+    # Phase 6: 把 decoder_skip 放到 device (与 SD2 UNet 保持一致 dtype)
+    if args.use_decoder_skip and decoder_skip_module is not None:
+        decoder_skip_module = decoder_skip_module.to(accelerator.device)
+        decoder_skip_module.train()
 
     # === Phase 5: UNet LoRA (大幅突破 SD2 的 restoration 上限, 预期 +2~4 dB)
     #     LoRA 在 attention 的 Q/V (或 Q/K/V) 投影上加低秩适配, 训练量小 (~20M),
@@ -1378,10 +1406,20 @@ def main(args):
     #     print("==============")
 
     # RAM = ram(pretrained='preset/models/ram_swin_large_14m.pth',
-    #             pretrained_condition=args.ram_ft_path, 
+    #             pretrained_condition=args.ram_ft_path,
     #             image_size=384,
     #             vit='swin_l')
     # RAM.eval()
+
+    # === Phase 6: Decoder Skip Path (LQ → SD2 UNet up_blocks) ===
+    decoder_skip_module = None
+    decoder_skip_hooks = []
+    if args.use_decoder_skip:
+        from models.decoder_skip import DecoderSkipPath
+        decoder_skip_module = DecoderSkipPath(in_ch=64, alpha_init=0.0)
+        controlnet.set_decoder_skip(decoder_skip_module)
+        n_skip_params = sum(p.numel() for p in decoder_skip_module.parameters())
+        logger.info(f"[Phase 6: Decoder Skip] 已初始化, 参数 {n_skip_params:,}")
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
@@ -1440,6 +1478,7 @@ def main(args):
     # 其余 controlnet 参数 (含 7 个 zero_conv + DWConv/PWConv/LN + 编码器) 用 --learning_rate.
     # Phase 5 LoRA: 从 UNet 中收集 LoRA 参数 (lora_A, lora_B), 用主学习率
     alpha_params, gate_params, other_params, lora_params = [], [], [], []
+    decoder_skip_alpha_params, decoder_skip_other_params = [], []
     for name, p in controlnet.named_parameters():
         if not p.requires_grad:
             continue
@@ -1461,6 +1500,19 @@ def main(args):
         if lora_params:
             print(f"[Phase 5: LoRA] 检测到 {len(lora_params)} 个 UNet LoRA 参数, "
                   f"lr={args.lora_lr}")
+
+    # Phase 6: 收集 Decoder Skip 参数 (alpha 单独 LR)
+    if args.use_decoder_skip and decoder_skip_module is not None:
+        for name, p in decoder_skip_module.named_parameters():
+            if not p.requires_grad:
+                continue
+            if name.endswith(".alpha"):
+                decoder_skip_alpha_params.append(p)
+            else:
+                decoder_skip_other_params.append(p)
+        print(f"[Phase 6: Decoder Skip] 检测到 {len(decoder_skip_other_params)} 个主参数 "
+              f"(lr={args.decoder_skip_lr}), {len(decoder_skip_alpha_params)} 个 alpha "
+              f"(lr={args.decoder_skip_alpha_lr})")
 
     if alpha_params:
         print(f"[ARCA] 检测到 {len(alpha_params)} 个 stage_alpha 参数, "
@@ -1489,6 +1541,19 @@ def main(args):
             "params": gate_params, "lr": args.gate_lr,
             "weight_decay": args.gate_weight_decay,
             "name": "arca_gate",
+        })
+    # Phase 6: decoder_skip 参数组
+    if decoder_skip_other_params:
+        param_groups.append({
+            "params": decoder_skip_other_params, "lr": args.decoder_skip_lr,
+            "weight_decay": args.adam_weight_decay,
+            "name": "decoder_skip_main",
+        })
+    if decoder_skip_alpha_params:
+        param_groups.append({
+            "params": decoder_skip_alpha_params, "lr": args.decoder_skip_alpha_lr,
+            "weight_decay": 0.0,
+            "name": "decoder_skip_alpha",
         })
     if not alpha_params and not gate_params:
         # Fallback: 不应该发生, 但保留以防 ARCA 结构变更
@@ -1839,13 +1904,34 @@ def main(args):
 
                 controlnet_image = batch["conditioning_pixel_values"].to(accelerator.device, dtype=weight_dtype)
 
-                down_block_res_samples, mid_block_res_sample = controlnet(
+                controlnet_out = controlnet(
                     noisy_latents,
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states,
                     controlnet_cond=controlnet_image,
-                    return_dict=False,
+                    return_dict=True,
                 )
+                down_block_res_samples = controlnet_out.down_block_res_samples
+                mid_block_res_sample = controlnet_out.mid_block_res_sample
+                decoder_skip_dict = getattr(controlnet_out, 'decoder_skip', None)
+
+                # Phase 6: 注册 SD2 UNet up_block hooks 注入 decoder skip
+                if decoder_skip_dict is not None:
+                    from models.decoder_skip import attach_decoder_skip_hooks, detach_decoder_skip_hooks
+                    # 每次 forward 都重新注册 (使用最新的 decoder_skip_dict)
+                    if decoder_skip_hooks:
+                        detach_decoder_skip_hooks(decoder_skip_hooks)
+                        decoder_skip_hooks = []
+
+                    def make_decoder_skip_fn(skip_dict):
+                        def fn(hidden_states):
+                            return skip_dict
+                        return fn
+
+                    skip_fn = make_decoder_skip_fn(decoder_skip_dict)
+                    decoder_skip_hooks = attach_decoder_skip_hooks(
+                        unet, skip_fn, target_blocks=(0, 1, 2),
+                    )
 
                 # Predict the noise residual
                 model_pred = unet(
@@ -1857,6 +1943,12 @@ def main(args):
                     ],
                     mid_block_additional_residual=mid_block_res_sample.to(dtype=weight_dtype),
                 ).sample
+
+                # Phase 6: unet forward 完成后清理 hooks (避免跨 step 累积)
+                if decoder_skip_hooks:
+                    from models.decoder_skip import detach_decoder_skip_hooks
+                    detach_decoder_skip_hooks(decoder_skip_hooks)
+                    decoder_skip_hooks = []
 
                 # Get the target for loss depending on the prediction type
                 if noise_scheduler.config.prediction_type == "epsilon":

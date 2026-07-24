@@ -92,6 +92,14 @@ class WeatherRestorationControlNet(ControlNetModel):
         # ---- 1. 退化感知编码器 ----
         self.weather_encoder = WeatherDegradationEncoder(in_channels=in_channels)
 
+        # ---- 1b. Decoder Skip Path (Phase 6) - 可选, 默认关闭 ----
+        # 从 encoder 浅层 (feat_128) 直接构造 decoder 各层 skip 残差,
+        # 通过外部 hook 注入到 SD2 UNet up_blocks.res_hidden_states_tuple
+        # 不破坏 SD2 预训练 (init=0), 默认关闭避免对老 checkpoint 的兼容性影响
+        self.use_decoder_skip = False
+        self.decoder_skip = None  # 由外部赋值 (train_controlnet.py 在初始化时构造)
+        self._last_decoder_skip = None  # 缓存本次 forward 计算的 decoder skip dict
+
         # ---- 2. 四级 Timed-C2F ----
         self.timed_c2f_blocks = nn.ModuleList([
             TimedC2FBlock(
@@ -313,6 +321,27 @@ class WeatherRestorationControlNet(ControlNetModel):
                 nn.init.zeros_(zc.bias)
 
     # ========================================================================
+    # Decoder Skip 控制 (Phase 6)
+    # ========================================================================
+
+    def set_decoder_skip(self, decoder_skip_module):
+        """外部注入 DecoderSkipPath 实例. None 则禁用.
+
+        Args:
+            decoder_skip_module: DecoderSkipPath 实例, 或 None (禁用)
+        """
+        if decoder_skip_module is None:
+            self.use_decoder_skip = False
+            self.decoder_skip = None
+        else:
+            self.decoder_skip = decoder_skip_module
+            self.use_decoder_skip = True
+        # 不依赖 logger (避免循环导入)
+        import sys
+        print(f"[WeatherRestorationControlNet] decoder_skip={'enabled' if self.use_decoder_skip else 'disabled'}",
+              file=sys.stderr)
+
+    # ========================================================================
     # 前向
     # ========================================================================
 
@@ -345,11 +374,41 @@ class WeatherRestorationControlNet(ControlNetModel):
             timestep = timestep[None].to(sample.device).expand(sample.shape[0])
 
         # ---- 1. 退化感知编码 ----
-        feats = self.weather_encoder(controlnet_cond)
+        encoder_out = self.weather_encoder(controlnet_cond, return_shallow=self.use_decoder_skip)
+        # 兼容两种返回格式:
+        #   list  (旧)                       - 不含浅层特征
+        #   dict  (Phase 6 修订) - 含 multi_scale + feat_256 + feat_128 + feat_64
+        if isinstance(encoder_out, dict):
+            feats = encoder_out['multi_scale']
+            feat_256 = encoder_out.get('feat_256')
+            feat_128 = encoder_out.get('feat_128')
+            feat_64  = encoder_out.get('feat_64')
+        else:
+            feats = encoder_out
+            feat_256 = feat_128 = feat_64 = None
         # feats[0] F64: (B, 320, H/8, W/8)
         # feats[1] F32: (B, 640, H/16, W/16)
         # feats[2] F16: (B, 1280, H/32, W/32)
         # feats[3] F8 : (B, 1280, H/64, W/64)
+
+        # ---- 1b. Decoder Skip Path (Phase 6 修订) - 可选 ----
+        # 用 encoder 原生三尺度浅层特征 (feat_256 / feat_128 / feat_64) 构造 decoder 各层 skip
+        # 特征映射 (Phase 6 修订):
+        #   feat_64  -> up_block_0 (16x16,  1280ch)  # 4× AvgPool + 1×1 proj
+        #   feat_128 -> up_block_1 (32x32,  640ch)
+        #   feat_256 -> up_block_2 (64x64,  320ch)
+        decoder_skip_dict = None
+        if (self.use_decoder_skip
+                and self.decoder_skip is not None
+                and feat_256 is not None
+                and feat_128 is not None
+                and feat_64 is not None):
+            decoder_skip_dict = self.decoder_skip(feat_256, feat_128, feat_64)
+            # 关键: 不管 return_dict 是 True 还是 False, 都把 decoder_skip 存到 self 属性
+            # 让外部 hook (evaluate.py 的 up_block hook) 能读取.
+            # 原因: SD2 pipeline 调用 controlnet 用 return_dict=False, 返回 2-tuple,
+            #       此时 decoder_skip_dict 无法通过返回值传递.
+            self._last_decoder_skip = decoder_skip_dict
 
         # ---- 2. 四级 TimedC2F + ARCA, 产出 4 个主残差 (已是 zero_conv + alpha 校准后) ----
         # 第一步: 4 个 TimedC2F 块处理 feats (雨/雪/雾特征精炼, 含粗细分支 + 时序调制)
@@ -393,13 +452,20 @@ class WeatherRestorationControlNet(ControlNetModel):
             mid_block_res_sample = mid_block_res_sample * conditioning_scale
 
         if not return_dict:
+            # 兼容旧接口: (down_res_samples, mid_block_res_sample)
+            # 关键: 保持 2-tuple 不变 (SD2 pipeline 期望 2-tuple 解包),
+            # decoder_skip_dict 通过 self._last_decoder_skip 属性传递
             return (down_res_samples, mid_block_res_sample)
 
         from diffusers.models.controlnets.controlnet import ControlNetOutput
-        return ControlNetOutput(
+        out = ControlNetOutput(
             down_block_res_samples=down_res_samples,
             mid_block_res_sample=mid_block_res_sample,
         )
+        # Phase 6: 把 decoder_skip_dict 附加到 out 对象 (动态属性)
+        if decoder_skip_dict is not None:
+            out.decoder_skip = decoder_skip_dict
+        return out
 
     # ========================================================================
     # diffusers 兼容接口
