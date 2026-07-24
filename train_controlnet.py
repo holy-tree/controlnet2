@@ -1482,6 +1482,9 @@ def main(args):
     for name, p in controlnet.named_parameters():
         if not p.requires_grad:
             continue
+        # Phase 6: decoder_skip 已作为子模块注册到 controlnet, 跳过, 由其专用收集器处理
+        if name.startswith("decoder_skip."):
+            continue
         if name.endswith(".alpha"):
             alpha_params.append(p)
         elif name.endswith(".gate"):
