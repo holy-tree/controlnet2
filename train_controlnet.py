@@ -1372,6 +1372,16 @@ def main(args):
     text_encoder.requires_grad_(False)
     controlnet.train()
 
+    # === Phase 6: Decoder Skip Path (LQ → SD2 UNet up_blocks) ===
+    decoder_skip_module = None
+    decoder_skip_hooks = []
+    if args.use_decoder_skip:
+        from models.decoder_skip import DecoderSkipPath
+        decoder_skip_module = DecoderSkipPath(in_ch=64, alpha_init=0.0)
+        controlnet.set_decoder_skip(decoder_skip_module)
+        n_skip_params = sum(p.numel() for p in decoder_skip_module.parameters())
+        logger.info(f"[Phase 6: Decoder Skip] 已初始化, 参数 {n_skip_params:,}")
+
     # Phase 6: 把 decoder_skip 放到 device (与 SD2 UNet 保持一致 dtype)
     if args.use_decoder_skip and decoder_skip_module is not None:
         decoder_skip_module = decoder_skip_module.to(accelerator.device)
@@ -1410,16 +1420,6 @@ def main(args):
     #             image_size=384,
     #             vit='swin_l')
     # RAM.eval()
-
-    # === Phase 6: Decoder Skip Path (LQ → SD2 UNet up_blocks) ===
-    decoder_skip_module = None
-    decoder_skip_hooks = []
-    if args.use_decoder_skip:
-        from models.decoder_skip import DecoderSkipPath
-        decoder_skip_module = DecoderSkipPath(in_ch=64, alpha_init=0.0)
-        controlnet.set_decoder_skip(decoder_skip_module)
-        n_skip_params = sum(p.numel() for p in decoder_skip_module.parameters())
-        logger.info(f"[Phase 6: Decoder Skip] 已初始化, 参数 {n_skip_params:,}")
 
     if args.enable_xformers_memory_efficient_attention:
         if is_xformers_available():
