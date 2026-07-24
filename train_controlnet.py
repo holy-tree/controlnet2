@@ -1907,16 +1907,16 @@ def main(args):
 
                 controlnet_image = batch["conditioning_pixel_values"].to(accelerator.device, dtype=weight_dtype)
 
-                controlnet_out = controlnet(
+                down_block_res_samples, mid_block_res_sample = controlnet(
                     noisy_latents,
                     timesteps,
                     encoder_hidden_states=encoder_hidden_states,
                     controlnet_cond=controlnet_image,
-                    return_dict=True,
+                    return_dict=False,
                 )
-                down_block_res_samples = controlnet_out.down_block_res_samples
-                mid_block_res_sample = controlnet_out.mid_block_res_sample
-                decoder_skip_dict = getattr(controlnet_out, 'decoder_skip', None)
+                # Phase 6: decoder_skip 通过控制网缓存的属性传递 (return_dict=False 无法附加到 tuple)
+                decoder_skip_dict = (controlnet._last_decoder_skip
+                                     if args.use_decoder_skip else None)
 
                 # Phase 6: 注册 SD2 UNet up_block hooks 注入 decoder skip
                 if decoder_skip_dict is not None:
