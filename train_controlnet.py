@@ -1338,7 +1338,7 @@ def main(args):
                     # load diffusers style into model
                     load_model = WeatherRestorationControlNet.from_pretrained(input_dir, subfolder="controlnet")
                     model.register_to_config(**load_model.config)
-                    model.load_state_dict(load_model.state_dict())
+                    model.load_state_dict(load_model.state_dict(), strict=False)
                     del load_model
 
             # 恢复 UNet LoRA 权重 (models 列表里没有 unet, 必须显式处理)
